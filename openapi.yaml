@@ -6,10 +6,14 @@ info:
   description: |
     docs/api.md と同じ内容の機械可読な仕様。食い違いはバグ。
 
-    - リクエスト本文は `application/json` のみ（それ以外は 415）。未知のフィールドは 400。
-    - `TTS_TOKEN` を設定したときだけ、`/healthz` と設定画面（`/admin/`）以外で `Authorization: Bearer <TTS_TOKEN>` が必須。
+    - リクエスト本文は `application/json` のみ（それ以外は 415。JSON を受ける POST / PUT は本文が空でも）。未知のフィールドは 400。本文の上限は 1MB（超えたら 400）。
+    - `TTS_TOKEN` を設定したときだけ、`/healthz` と設定画面（`/admin/`）以外で `Authorization: Bearer <TTS_TOKEN>` が必須（`TTS_ADMIN_TOKEN` でも通る）。
       `/v1/admin/*` は `TTS_ADMIN_TOKEN` を設定したときだけその値が必須（未設定なら `TTS_TOKEN` の規則）。
-    - `TTS_ALLOW_CIDRS` に入らない接続元は 403。CORS ヘッダは返さない。
+      認証はパスの有無より先（トークンが要る構成では、未定義のパス・未対応のメソッドも未認証なら 401）。
+    - `TTS_ALLOW_CIDRS` に入らない接続元は 403（`forbidden`）。CORS ヘッダは返さない。
+    - `Host` が `TTS_HOSTS` の各アドレス:`TTS_PORT`（IPv6 は `[::1]:8710`。ポート 80 ならポート無しも可）・ループバックで待ち受けるときの `localhost:<port>`・`TTS_ALLOWED_HOSTS` のホスト名（ポートは問わない）以外、または無ければ全パスで 421（`misdirected_request`）。
+    - GET / HEAD / OPTIONS 以外で `Origin` があり、その host（ポート含む）が上の Host の許可に入らなければ 403（`forbidden_origin`）。`Origin: null` も 403。
+    - 存在するパスへの未対応メソッドは 405（`method_not_allowed`、`Allow` ヘッダ付き）。解釈できないリクエストターゲット（`GET //` など）は 400（`bad_request`）。
 
     音声合成：ZEN-TTS（https://zenryokukikai.com ）。この API で作った音声を使う側でもクレジットの表示が必要。
   license:
@@ -44,6 +48,20 @@ paths:
                 $ref: '#/components/schemas/Health'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
+    head:
+      operationId: headHealth
+      tags: [health]
+      summary: 死活確認（本文なし。認証不要）
+      security: []
+      responses:
+        '200':
+          description: OK（本文なし）
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/engines:
     get:
       operationId: listEngines
@@ -60,6 +78,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/synthesize:
     post:
       operationId: synthesize
@@ -142,6 +162,8 @@ paths:
           $ref: '#/components/responses/TextTooLong'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
         '422':
           $ref: '#/components/responses/ModelNotInstalled'
         '429':
@@ -183,6 +205,8 @@ paths:
           $ref: '#/components/responses/TextTooLong'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/dictionary:
     get:
       operationId: getDictionary
@@ -199,6 +223,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/admin/status:
     get:
       operationId: getStatus
@@ -215,6 +241,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/admin/settings:
     get:
       operationId: getSettings
@@ -231,6 +259,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
     put:
       operationId: updateSettings
       tags: [admin]
@@ -258,6 +288,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/admin/catalog:
     get:
       operationId: getCatalog
@@ -274,6 +306,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/admin/models:
     get:
       operationId: listModels
@@ -290,6 +324,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
     post:
       operationId: addModel
       tags: [admin]
@@ -319,6 +355,8 @@ paths:
           $ref: '#/components/responses/Conflict'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/admin/models/{engine}/{id}/download:
     post:
       operationId: redownloadModel
@@ -344,6 +382,8 @@ paths:
           $ref: '#/components/responses/Conflict'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/admin/models/{engine}/{id}:
     delete:
       operationId: deleteModel
@@ -365,6 +405,8 @@ paths:
           $ref: '#/components/responses/Conflict'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/admin/dictionary/{surface}:
     parameters:
       - name: surface
@@ -400,6 +442,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
     delete:
       operationId: deleteReading
       tags: [admin]
@@ -419,6 +463,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/admin/cache:
     delete:
       operationId: clearCache
@@ -433,6 +479,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
 components:
   securitySchemes:
     bearerAuth:
@@ -456,7 +504,7 @@ components:
         pattern: '^[a-z0-9][a-z0-9_-]{0,31}$'
   responses:
     BadRequest:
-      description: パラメータ不正（範囲外・型違い・未知のフィールド・そのエンジンが対応しないオプション）
+      description: パラメータ不正（範囲外・型違い・未知のフィールド・そのエンジンが対応しないオプション・本文が 1MB 超。`invalid_request`）、解釈できないリクエストターゲット（`bad_request`）
       content:
         application/json:
           schema:
@@ -473,7 +521,7 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
     Forbidden:
-      description: 接続元が許可リスト外
+      description: 接続元が許可リスト外（`forbidden`）、GET / HEAD / OPTIONS 以外で Origin が許可外・null（`forbidden_origin`）
       content:
         application/json:
           schema:
@@ -497,7 +545,24 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
     UnsupportedMediaType:
-      description: JSON 以外の本文
+      description: JSON 以外の本文（JSON を受ける POST / PUT は本文が空でも）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    MethodNotAllowed:
+      description: パスはあるがメソッドが違う（各操作には書かない。どのパスでも起こる）
+      headers:
+        Allow:
+          description: そのパスで使えるメソッド（例 `GET, HEAD`）
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    MisdirectedRequest:
+      description: Host ヘッダが許可外・無い
       content:
         application/json:
           schema:
@@ -556,10 +621,14 @@ components:
               type: string
               enum:
                 - invalid_request
+                - bad_request
                 - unauthorized
                 - forbidden
+                - forbidden_origin
                 - not_found
+                - method_not_allowed
                 - conflict
+                - misdirected_request
                 - text_too_long
                 - unsupported_media_type
                 - model_not_installed
