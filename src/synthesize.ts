@@ -5,9 +5,9 @@
 import { createHash } from 'node:crypto';
 import { ApiError, invalid, notFound } from './errors.ts';
 import type { AudioCache } from './cache.ts';
-import { CONTENT_TYPES, DEFAULT_BITRATES, encode, outputSampleRate } from './audio/encode.ts';
+import { CONTENT_TYPES, DEFAULT_BITRATES, encode, ffmpegUnavailable, needsFfmpeg, outputSampleRate, type FfmpegProbe } from './audio/encode.ts';
 import { applyGain, concat, samplesToMs, silence, trimSilence } from './audio/pcm.ts';
-import type { Engine } from './engines/types.ts';
+import { SentenceTooLongError, type Engine } from './engines/types.ts';
 import type { ModelRecord, Registry } from './models/registry.ts';
 import type { SynthQueue } from './queue.ts';
 import type { SettingsStore } from './settings.ts';
@@ -127,6 +127,55 @@ export const cacheKey = (o: {
 
 // ---- 音声を作る ----
 
+/** 1 回の合成の上限を超えた文を割り直す深さの上限（最大 2^4 = 16 片） */
+export const MAX_SPLIT_DEPTH = 4;
+/** 割る位置にする文字（読点・空白・中黒） */
+const SPLIT_AT_RE = /[、，, 　・]/;
+
+/** 文を 2 つに割る。中央に最も近い読点・空白・中黒の後（無ければ中央のコードポイント境界）。1 文字なら null */
+export const splitInHalf = (sentence: string): [string, string] | null => {
+  const chars = [...sentence];
+  if (chars.length < 2) return null;
+  const mid = chars.length / 2;
+  let cut = Math.floor(mid);
+  let best = Infinity;
+  for (let i = 0; i < chars.length - 1; i++) {
+    if (SPLIT_AT_RE.test(chars[i]!) && Math.abs(i + 1 - mid) < best) {
+      best = Math.abs(i + 1 - mid);
+      cut = i + 1;
+    }
+  }
+  return [chars.slice(0, cut).join(''), chars.slice(cut).join('')];
+};
+
+/**
+ * 1 文を合成する。エンジンの上限を超えたら（SentenceTooLongError）半分に割ってそれぞれ合成し、無音を挟まずにつなぐ。
+ * MAX_SPLIT_DEPTH 段割っても、1 文字まで割っても超えるなら 422 unprocessable_text
+ */
+export const synthesizeSentence = async (
+  o: { engine: Engine; voice: ModelRecord; options: Record<string, unknown>; signal: AbortSignal; slot: number },
+  sentence: string,
+  depth = 0,
+): Promise<Float32Array> => {
+  try {
+    return await o.engine.synthesize(sentence, o.voice, o.options, o.signal, o.slot);
+  } catch (e) {
+    if (!(e instanceof SentenceTooLongError)) throw e;
+    // 中断されたら割り直さない
+    o.signal.throwIfAborted();
+    const halves = depth < MAX_SPLIT_DEPTH ? splitInHalf(sentence) : null;
+    if (!halves) throw new ApiError(422, 'unprocessable_text', 'text contains a word too long to read');
+    const parts: Float32Array[] = [];
+    for (const half of halves) {
+      // 割った片の端の空白は落とし、読める文字の無い片は飛ばす
+      const piece = half.trim();
+      o.signal.throwIfAborted();
+      if (piece && SPEAKABLE_RE.test(piece)) parts.push(await synthesizeSentence(o, piece, depth + 1));
+    }
+    return concat(parts);
+  }
+};
+
 /** 文を順に合成し、無音・連結・音量を経てエンコードする */
 export const renderAudio = async (o: {
   engine: Engine;
@@ -136,19 +185,21 @@ export const renderAudio = async (o: {
   options: Record<string, unknown>;
   signal: AbortSignal;
   ffmpeg: string;
+  /** 待ち行列のスロット（エンジンの合成プロセス）。省略時は 0 */
+  slot?: number;
 }): Promise<{ audio: Buffer; durationMs: number; sampleRate: number }> => {
   const sr = o.engine.sampleRate;
   const p = o.params;
   const parts: Float32Array[] = [silence(p.leadingSilenceMs, sr)];
   for (const [i, sentence] of o.sentences.entries()) {
-    let pcm = await o.engine.synthesize(sentence, o.voice, o.options, o.signal);
+    let pcm = await synthesizeSentence({ ...o, slot: o.slot ?? 0 }, sentence);
     if (p.trimSilence) pcm = trimSilence(pcm, sr);
     if (i > 0) parts.push(silence(p.sentencePauseMs, sr));
     parts.push(pcm);
   }
   parts.push(silence(p.trailingSilenceMs, sr));
   const pcm = applyGain(concat(parts), p.volume);
-  const audio = await encode(pcm, sr, { format: p.format, sampleRate: p.sampleRate, bitrate: p.bitrate, ffmpeg: o.ffmpeg });
+  const audio = await encode(pcm, sr, { format: p.format, sampleRate: p.sampleRate, bitrate: p.bitrate, ffmpeg: o.ffmpeg, signal: o.signal });
   return { audio, durationMs: samplesToMs(pcm.length, sr), sampleRate: outputSampleRate(p.format, p.sampleRate) };
 };
 
@@ -174,6 +225,8 @@ export type SynthesizerDeps = {
   maxChars: number;
   timeoutSec: number;
   ffmpeg: string;
+  /** ffmpeg の有無（省略時は使える扱い）。使えなければ ffmpeg の要る要求を起動せずに 503 */
+  ffmpegProbe?: FfmpegProbe;
 };
 
 export class Synthesizer {
@@ -194,7 +247,8 @@ export class Synthesizer {
   /** POST /v1/normalize */
   normalize(raw: unknown): Prepared & { text: string } {
     const req = this.validate(raw);
-    const p = prepareText(req, this.d.dictionary);
+    const limit = this.d.engines.get(req.engine)!.sentenceCharLimit?.(req.options) ?? Infinity;
+    const p = prepareText({ ...req, maxSentenceChars: Math.min(req.maxSentenceChars, limit) }, this.d.dictionary);
     return { text: req.text, ...p };
   }
 
@@ -208,8 +262,8 @@ export class Synthesizer {
     return rec;
   }
 
-  /** POST /v1/synthesize */
-  async synthesize(raw: unknown): Promise<SynthResult> {
+  /** POST /v1/synthesize。signal はクライアントの切断（待ち行列・エンジン・ffmpeg まで届く。合流中は全員が切断したときだけ止める） */
+  async synthesize(raw: unknown, signal?: AbortSignal): Promise<SynthResult> {
     const req = this.validate(raw);
     const engine = this.d.engines.get(req.engine)!;
     const voice = this.resolveVoice(engine, req.voice);
@@ -240,16 +294,24 @@ export class Synthesizer {
         };
     }
 
+    if (this.d.ffmpegProbe && needsFfmpeg(params.format, params.sampleRate, engine.sampleRate)) {
+      if (!(await this.d.ffmpegProbe.get()).available) throw ffmpegUnavailable(this.d.ffmpeg);
+    }
+
     // キャッシュを使わない要求は合流しない（毎回作る）
-    const { promise } = this.d.queue.run(useCache ? key : undefined, async () => {
+    // 待ち行列での待ちも timeoutSec まで（要求全体のタイムアウトは実行が始まってから数える）
+    const { promise } = this.d.queue.run(useCache ? key : undefined, async (slot, stop) => {
       const started = performance.now();
       const ac = new AbortController();
       const timer = setTimeout(
         () => ac.abort(new ApiError(504, 'timeout', `synthesis took longer than ${this.d.timeoutSec}s`)),
         this.d.timeoutSec * 1000,
       );
+      const jobSignal = AbortSignal.any([ac.signal, stop]);
       try {
-        const r = await renderAudio({ engine, voice, sentences, params, options: req.options, signal: ac.signal, ffmpeg: this.d.ffmpeg });
+        const r = await renderAudio({ engine, voice, sentences, params, options: req.options, signal: jobSignal, ffmpeg: this.d.ffmpeg, slot });
+        // 中断された合成はキャッシュに書かない
+        if (jobSignal.aborted) throw jobSignal.reason;
         const synthesisMs = Math.round(performance.now() - started);
         if (useCache) {
           await this.d.cache
@@ -260,7 +322,7 @@ export class Synthesizer {
       } finally {
         clearTimeout(timer);
       }
-    });
+    }, `${engine.id}/${voice.id}`, { signal, waitTimeoutMs: this.d.timeoutSec * 1000 });
     const r = await promise;
     return {
       audio: r.audio, contentType, engine, voice: voice.id, durationMs: r.durationMs, sampleRate: r.sampleRate,

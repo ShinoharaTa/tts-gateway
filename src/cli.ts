@@ -36,6 +36,9 @@ const serve = async (): Promise<void> => {
     onFatal: () => void stop('listen failed', 1),
   });
   console.error(`tts-gateway: data ${config.dataDir}, cache ${config.cacheDir}`);
+  const ffmpeg = await app.ffmpeg.get();
+  if (!ffmpeg.available)
+    console.error(`ffmpeg is not available (${ffmpeg.path}: ${ffmpeg.reason}): only wav at the engine's sample rate can be returned`);
   process.on('SIGINT', () => void stop('SIGINT'));
   process.on('SIGTERM', () => void stop('SIGTERM'));
 };

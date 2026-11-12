@@ -27,6 +27,8 @@ export type Config = {
   dataDir: string;
   cacheDir: string;
   concurrency: number;
+  /** 最初に追い越されてからこれ以上たった要求は、声が違っても次の空きスロットに流す（ミリ秒） */
+  affinityMaxWaitMs: number;
   queueMax: number;
   maxChars: number;
   timeoutSec: number;
@@ -107,6 +109,7 @@ export const loadConfig = (env: Env = process.env, warn: (msg: string) => void =
     dataDir: resolve(env.TTS_DATA_DIR || join(dataHome, 'tts-gateway')),
     cacheDir: resolve(env.TTS_CACHE_DIR || join(cacheHome, 'tts-gateway', 'audio')),
     concurrency: int(env, 'TTS_CONCURRENCY', 1, 1, 2),
+    affinityMaxWaitMs: int(env, 'TTS_AFFINITY_MAX_WAIT_MS', 5000, 0, 60_000),
     queueMax: int(env, 'TTS_QUEUE_MAX', 8, 0, 1000),
     maxChars: int(env, 'TTS_MAX_CHARS', 2000, 1, 100_000),
     timeoutSec: int(env, 'TTS_TIMEOUT_SEC', 60, 1, 3600),

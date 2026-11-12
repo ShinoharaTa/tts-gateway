@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createServer, request, type Server } from 'node:http';
+import { chmod, rm, writeFile } from 'node:fs/promises';
 import { connect, type AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -337,6 +338,70 @@ test('Host: TTS_HOSTS:TTS_PORT と localhost:TTS_PORT だけ。ほかと欠落�
   }
 });
 
+test('ffmpeg が無い: mp3 は 503、エンジンのサンプルレートの wav は 200、status に available=false', async () => {
+  const c = await start({ FFMPEG: '/nonexistent/ffmpeg' });
+  try {
+    const st = (await (await fetch(`${c.base}/v1/admin/status`)).json()) as { ffmpeg: unknown };
+    assert.deepEqual(st.ffmpeg, { available: false, path: '/nonexistent/ffmpeg', version: null, reason: 'spawn /nonexistent/ffmpeg ENOENT' });
+    const mp3 = await fetch(`${c.base}/v1/synthesize`, json({ text: 'こんにちは。', format: 'mp3' }));
+    assert.equal(mp3.status, 503);
+    assert.deepEqual(await mp3.json(), { error: { code: 'engine_unavailable', message: 'ffmpeg is not available (/nonexistent/ffmpeg)' } });
+    // リサンプルの要る wav も 503
+    assert.equal((await fetch(`${c.base}/v1/synthesize`, json({ text: 'こんにちは。', sampleRate: 16000 }))).status, 503);
+    assert.equal(c.engine.calls.length, 0);
+    const wav = await fetch(`${c.base}/v1/synthesize`, json({ text: 'こんにちは。', sampleRate: 8000 }));
+    assert.equal(wav.status, 200);
+    assert.equal(wav.headers.get('content-type'), 'audio/wav');
+  } finally {
+    await c.stop();
+  }
+});
+
+test('ffmpeg が probe の後に消えた: mp3 は 500 ではなく 503 engine_unavailable', async () => {
+  const { dir, cleanup } = await tempDir();
+  const fake = join(dir, 'ffmpeg');
+  await writeFile(fake, '#!/bin/sh\necho "ffmpeg version 7.0.2"\n');
+  await chmod(fake, 0o755);
+  const c = await start({ FFMPEG: fake });
+  try {
+    const st = (await (await fetch(`${c.base}/v1/admin/status`)).json()) as { ffmpeg: { available: boolean } };
+    assert.equal(st.ffmpeg.available, true);
+    await rm(fake);
+    const mp3 = await fetch(`${c.base}/v1/synthesize`, json({ text: 'こんにちは。', format: 'mp3' }));
+    assert.equal(mp3.status, 503);
+    assert.deepEqual(await mp3.json(), { error: { code: 'engine_unavailable', message: `ffmpeg is not available (${fake})` } });
+  } finally {
+    await c.stop();
+    await cleanup();
+  }
+});
+
+/** 条件が満たされるまで待つ（最大 2 秒） */
+const until = async (cond: () => boolean): Promise<void> => {
+  for (let i = 0; i < 200 && !cond(); i++) await new Promise(r => setTimeout(r, 10));
+  assert.ok(cond());
+};
+
+test('synthesize: 合成中に接続を切るとエンジンの signal が abort され、キャッシュに書かない', async () => {
+  const c = await start();
+  try {
+    c.engine.delayMs = 1000;
+    const ac = new AbortController();
+    const res = fetch(`${c.base}/v1/synthesize`, { ...json({ text: 'こんにちは。' }), signal: ac.signal });
+    await until(() => c.engine.signals.length === 1);
+    ac.abort();
+    await assert.rejects(res);
+    await until(() => c.engine.signals[0]!.aborted);
+    await until(() => c.app.queue.stats().running === 0);
+    c.engine.delayMs = 0;
+    const r = await fetch(`${c.base}/v1/synthesize`, json({ text: 'こんにちは。' }));
+    assert.equal(r.status, 200);
+    assert.equal(r.headers.get('x-cache'), 'miss');
+  } finally {
+    await c.stop();
+  }
+});
+
 test('Host: TTS_ALLOWED_HOSTS はポートを問わず、大文字小文字を区別しない', async () => {
   const c = await start({ TTS_ALLOWED_HOSTS: 'tts.example.com, MyHost.tailnet.example' });
   try {
@@ -429,6 +494,45 @@ test('400（不正なリクエストターゲット）・405・415（本文が�
         assert.equal(rawCode(r), 'unsupported_media_type');
       }
     }
+  } finally {
+    await c.stop();
+  }
+});
+
+test('synthesize: 合流中は 1 人が切断しても合成を続け、残った要求に返す。全員が切断したら止める', async () => {
+  const c = await start();
+  try {
+    c.engine.delayMs = 300;
+    const body = json({ text: 'こんにちは。' });
+    const ac = new AbortController();
+    const gone = fetch(`${c.base}/v1/synthesize`, { ...body, signal: ac.signal });
+    await until(() => c.engine.signals.length === 1);
+    const stay = fetch(`${c.base}/v1/synthesize`, body);
+    // 合流するまで待ってから切る
+    await new Promise(r => setTimeout(r, 50));
+    ac.abort();
+    await assert.rejects(gone);
+    const r = await stay;
+    assert.equal(r.status, 200);
+    assert.equal(r.headers.get('x-cache'), 'miss');
+    assert.equal(c.engine.calls.length, 1);
+    assert.equal(c.engine.signals[0]!.aborted, false);
+
+    // 全員が切断
+    c.engine.delayMs = 1000;
+    const body2 = json({ text: 'さようなら。' });
+    const acs = [new AbortController(), new AbortController()];
+    // 切った方の reject を待つ間に未処理にしない
+    const both = acs.map(a => fetch(`${c.base}/v1/synthesize`, { ...body2, signal: a.signal }).then(() => 'ok', () => 'aborted'));
+    await until(() => c.engine.signals.length === 2);
+    await new Promise(r => setTimeout(r, 50));
+    acs[0]!.abort();
+    await new Promise(r => setTimeout(r, 50));
+    assert.equal(c.engine.signals[1]!.aborted, false);
+    acs[1]!.abort();
+    assert.deepEqual(await Promise.all(both), ['aborted', 'aborted']);
+    await until(() => c.engine.signals[1]!.aborted);
+    assert.equal(c.engine.calls.length, 2);
   } finally {
     await c.stop();
   }
