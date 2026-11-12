@@ -28,7 +28,7 @@
 | 404 | `not_found` | エンジン・声・モデル・パスが無い |
 | 405 | `method_not_allowed` | パスはあるがメソッドが違う。`Allow` ヘッダ付き |
 | 409 | `conflict` | 同じ id のモデルがある・ダウンロード中（取得の要求が重なった）・削除の処理中 など |
-| 413 | `text_too_long` | `text` が上限（既定 2,000 字）を超えた |
+| 413 | `text_too_long` | `text` が上限（`TTS_MAX_CHARS`、既定 2,000 字）を超えた。または前処理と読み辞書を通した後の文が上限の 3 倍（既定 6,000 字）を超えた |
 | 415 | `unsupported_media_type` | JSON 以外の本文（JSON を受ける `POST` / `PUT` は本文が空でも） |
 | 421 | `misdirected_request` | `Host` ヘッダが許可外・無い |
 | 422 | `model_not_installed` | 声は登録済みだが重みが未取得 |
@@ -97,7 +97,7 @@
 | `maxSentenceChars` | integer | `120` | 1 文の最大字数（`20`〜`120`）。超える文は読点・空白で分ける。ZEN-TTS で `speed` < 1 のときは `120 × speed` 字が上限になる |
 | `preprocess` | boolean | `true` | 記号の読み替え（URL 削除、`%`→パーセント、`$20`→20ドル、`→`→から 等） |
 | `dictionary` | boolean | `true` | 読み辞書（英字 → カタカナ）を通す |
-| `readings` | object | `{}` | この要求だけの読み辞書の追加・上書き。`{ "Foo": "フー" }`。最大 200 語。読みはカタカナ |
+| `readings` | object | `{}` | この要求だけの読み辞書の追加・上書き。`{ "Foo": "フー" }`。最大 200 語。読みはカタカナ。語・読みはそれぞれ 100 字まで（超えたら 400、`field` は `readings.<語>`） |
 | `cache` | boolean | `true` | `false` でキャッシュを読まず書かない |
 | `zenTts` | object | — | ZEN-TTS 固有のオプション（下表）。`engine` が `zen-tts` 以外なら 400 |
 
@@ -288,6 +288,7 @@ curl -sS -X POST http://127.0.0.1:8710/v1/synthesize \
 ### PUT /v1/admin/dictionary/{surface} / DELETE /v1/admin/dictionary/{surface}
 
 ユーザー辞書の語を追加・更新（本文 `{ "reading": "フー" }`）・削除。`surface` は URL エンコード。
+`surface`・`reading` はそれぞれ 100 字まで（超えたら 400、`field` は `surface` / `reading`）。
 組み込み辞書の語を `PUT` すると、ユーザー辞書の値で上書きされる（組み込みの TSV は変えない）。
 `DELETE` で消せるのはユーザー辞書の語だけ（組み込みは 404）。返り値は `GET /v1/dictionary` と同じ形。
 
@@ -304,6 +305,7 @@ curl -sS -X POST http://127.0.0.1:8710/v1/synthesize \
 - 置き換えない: URL・メールアドレス・ドメイン（`example.com`）の中、**全部大文字で 5 字以内の語**（`API` `GPU`。ZEN-TTS の略語規則に任せる）。
 - 語の直後の所有格 `'s` は消し、`-数字`・`-英字` のハイフンは空白にする（`Pixel-9` → ピクセル 9）。
 - 読みは全角カタカナ・長音符・中黒・空白だけ。
+- 語・読みはそれぞれ 100 字（コードポイント数）まで。前処理と辞書を通した後の文が `TTS_MAX_CHARS` の 3 倍を超えたら 413（`text_too_long`。`/v1/synthesize`・`/v1/normalize` とも）。
 
 ## キャッシュ
 

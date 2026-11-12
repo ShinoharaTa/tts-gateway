@@ -170,6 +170,50 @@ test('normalize と辞書', async () => {
   }
 });
 
+test('入力の上限: surface・読みは 100 字、辞書の適用後は TTS_MAX_CHARS × 3 字まで', async () => {
+  const c = await start();
+  try {
+    const errorOf = async (res: Response) => ((await res.json()) as { error: { code: string; message: string; field?: string } }).error;
+    // 長い読みと文分割で止まっていた入力（読み 1,000 字 × 666 回）。すぐに 400 で返る
+    let started = performance.now();
+    let r = await fetch(`${c.base}/v1/synthesize`, json({ text: 'zz '.repeat(666), readings: { zz: 'ア'.repeat(1000) } }));
+    assert.equal(r.status, 400);
+    assert.equal((await errorOf(r)).field, 'readings.zz');
+    assert.ok(performance.now() - started < 1000, 'synthesize');
+    // 上限内の読みでも、辞書の適用後に長くなりすぎたら 413（synthesize・normalize とも）
+    for (const path of ['/v1/synthesize', '/v1/normalize']) {
+      started = performance.now();
+      r = await fetch(`${c.base}${path}`, json({ text: 'zz '.repeat(666), readings: { zz: 'ア'.repeat(100) } }));
+      assert.equal(r.status, 413, path);
+      const e = await errorOf(r);
+      assert.equal(e.code, 'text_too_long');
+      assert.match(e.message, /after applying/);
+      assert.ok(performance.now() - started < 1000, path);
+    }
+    assert.equal(c.engine.calls.length, 0);
+    // 上限（2,000 × 3 = 6,000 字）以内なら通る。(8 + 1) × 666 = 5,994 字ほど
+    r = await fetch(`${c.base}/v1/normalize`, json({ text: 'zz '.repeat(666), readings: { zz: 'ア'.repeat(8) } }));
+    assert.equal(r.status, 200);
+    const spokenChars = [...((await r.json()) as { spoken: string }).spoken].length;
+    assert.ok(spokenChars > 5900 && spokenChars <= 6000, String(spokenChars));
+    // 辞書 API: surface・読みとも 100 字まで
+    const put = (surface: string, reading: string) =>
+      fetch(`${c.base}/v1/admin/dictionary/${encodeURIComponent(surface)}`, { ...json({ reading }), method: 'PUT' });
+    assert.equal((await put('a'.repeat(100), 'ア'.repeat(100))).status, 200);
+    r = await put('Foo', 'ア'.repeat(101));
+    assert.equal(r.status, 400);
+    assert.equal((await errorOf(r)).field, 'reading');
+    r = await put('Foo', 'ア'.repeat(50_000));
+    assert.equal(r.status, 400);
+    assert.equal((await errorOf(r)).field, 'reading');
+    r = await put('a'.repeat(101), 'ア');
+    assert.equal(r.status, 400);
+    assert.equal((await errorOf(r)).field, 'surface');
+  } finally {
+    await c.stop();
+  }
+});
+
 test('認証: TTS_TOKEN と TTS_ADMIN_TOKEN', async () => {
   const c = await start({ TTS_TOKEN: 'user-token', TTS_ADMIN_TOKEN: 'admin-token' });
   try {

@@ -111,6 +111,14 @@ test('readings: 最大 200 語・読みはカタカナ', () => {
   rejects({ text: 'a', readings: many }, 400, 'invalid_request', 'readings');
 });
 
+test('readings: surface と読みは 100 字まで（コードポイント数）', () => {
+  const ok = validateSynthRequest({ text: 'a', readings: { ['a'.repeat(100)]: 'ア'.repeat(99) + '𛀀' } }, ctx);
+  assert.equal(ok.readings['a'.repeat(100)], 'ア'.repeat(99) + '𛀀');
+  rejects({ text: 'a', readings: { ['a'.repeat(101)]: 'ア' } }, 400, 'invalid_request', `readings.${'a'.repeat(101)}`);
+  rejects({ text: 'a', readings: { zz: 'ア'.repeat(101) } }, 400, 'invalid_request', 'readings.zz');
+  rejects({ text: 'a', readings: { zz: 'ア'.repeat(1000) } }, 400, 'invalid_request', 'readings.zz');
+});
+
 test('他のエンジンのオプションは 400、未知のエンジンは 404', () => {
   rejects({ text: 'a', other: { speed: 1 } }, 400, 'invalid_request', 'other');
   rejects({ text: 'a', engine: 'other', zenTts: { speed: 1 } }, 400, 'invalid_request', 'zenTts');

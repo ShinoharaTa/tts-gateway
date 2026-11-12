@@ -25,6 +25,78 @@ test('splitSentences: 長い文は上限より前の最後の読点・空白で�
   for (const part of splitSentences('word '.repeat(60), 20)) assert.ok([...part].length <= 20);
 });
 
+/** 変更前の splitSentences（長い文を切るたびに文字列を作り直す。O(n²)） */
+const legacySplitSentences = (text: string, maxChars: number): string[] => {
+  const SENTENCE_END_RE = /[。！？!?]/;
+  const SOFT_BREAK_RE = /[、，, 　]/;
+  const SPEAKABLE_RE = /[\p{L}\p{N}]/u;
+  const out: string[] = [];
+  const push = (s: string): void => {
+    let rest = s.trim();
+    while ([...rest].length > maxChars) {
+      const chars = [...rest];
+      let cut = -1;
+      for (let i = maxChars - 1; i > 0; i--) {
+        if (SOFT_BREAK_RE.test(chars[i]!)) {
+          cut = i + 1;
+          break;
+        }
+      }
+      if (cut <= 0) cut = maxChars;
+      const head = chars.slice(0, cut).join('').trim();
+      if (head && SPEAKABLE_RE.test(head)) out.push(head);
+      rest = chars.slice(cut).join('').trim();
+    }
+    if (rest && SPEAKABLE_RE.test(rest)) out.push(rest);
+  };
+  for (const line of text.split(/\r?\n/)) {
+    let start = 0;
+    const chars = [...line];
+    for (let i = 0; i < chars.length; i++) {
+      if (SENTENCE_END_RE.test(chars[i]!) && !SENTENCE_END_RE.test(chars[i + 1] ?? '')) {
+        push(chars.slice(start, i + 1).join(''));
+        start = i + 1;
+      }
+    }
+    push(chars.slice(start).join(''));
+  }
+  return out;
+};
+
+test('splitSentences: 変更前の実装と同じ分け方', () => {
+  const inputs = [
+    '一つ目。二つ目!三つ目?\n四つ目',
+    '本当?!そうです。。。\r\n\n  \nはい。」',
+    'あ'.repeat(500),
+    `${'あいう、'.repeat(80)}えお。${'word '.repeat(70)}`,
+    `${'長い文 '.repeat(40)}　${'か　'.repeat(50)} 。 ！？ 😀${'𠮷'.repeat(130)}、\t終わり。`,
+    '  前後に空白  。　　次、  ,  ,  ， の文  \n\t',
+  ];
+  let seed = 3;
+  const rand = (): number => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff), seed / 0x80000000);
+  const pieces = ['あ', 'a', ' ', '、', ',', '，', '　', '。', '!', '?', '！', '？', '\n', '\r\n', '\t', '😀', '・', '「', '」'];
+  for (let n = 0; n < 200; n++) {
+    let s = '';
+    const len = Math.floor(rand() * 400);
+    for (let i = 0; i < len; i++) s += pieces[Math.floor(rand() * pieces.length)];
+    inputs.push(s);
+  }
+  // 120 は既定、96 は zenTts.speed 0.8 の sentenceCharLimit、20 は maxSentenceChars の下限
+  for (const input of inputs) {
+    for (const max of [120, 96, 20, Infinity]) assert.deepEqual(splitSentences(input, max), legacySplitSentences(input, max), JSON.stringify({ input, max }));
+  }
+});
+
+test('splitSentences: 10 万字でも 500ms 以内（句読点なし・あり）', () => {
+  for (const text of ['あ'.repeat(100_000), 'あいうえお、かきくけこ。'.repeat(100_000 / 12), 'word '.repeat(20_000)]) {
+    const started = performance.now();
+    const out = splitSentences(text, 120);
+    const ms = performance.now() - started;
+    assert.ok(out.length > 0);
+    assert.ok(ms < 500, `${ms.toFixed(0)}ms`);
+  }
+});
+
 const PARAMS: RenderParams = {
   format: 'wav', sampleRate: 8000, bitrate: undefined, volume: 0, sentencePauseMs: 250,
   leadingSilenceMs: 100, trailingSilenceMs: 50, trimSilence: true,

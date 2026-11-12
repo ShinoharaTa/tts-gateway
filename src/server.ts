@@ -24,8 +24,8 @@ import { isAllowed, parseIp } from './net.ts';
 import { SynthQueue } from './queue.ts';
 import { SettingsStore, validateSettingsPatch } from './settings.ts';
 import { Synthesizer } from './synthesize.ts';
-import { Dictionary, isAcronym, isReading } from './text/readings.ts';
-import { checkKeys, checkObject, checkString, checkSurface } from './validate.ts';
+import { Dictionary, isAcronym } from './text/readings.ts';
+import { checkKeys, checkObject, checkReading, checkString, checkSurface } from './validate.ts';
 
 export type App = {
   config: Config;
@@ -376,8 +376,7 @@ const putReading = async (app: App, rawSurface: string, raw: unknown): Promise<v
   const body = checkObject(raw, '');
   checkKeys(body, ['reading']);
   if (body.reading === undefined) throw invalid('reading is required', 'reading');
-  const reading = checkString(body.reading, 'reading').trim();
-  if (!isReading(reading)) throw invalid('reading must be katakana (with ー・ and spaces)', 'reading');
+  const reading = checkReading(checkString(body.reading, 'reading'), 'reading');
   await app.dictionary.set(surface, reading);
 };
 
