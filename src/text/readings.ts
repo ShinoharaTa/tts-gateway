@@ -26,7 +26,7 @@ export const normalizeSurface = (s: string): string => s.normalize('NFKC').trim(
 /** 照合のキー（大文字小文字を同一視） */
 export const surfaceKey = (s: string): string => normalizeSurface(s).toLowerCase();
 
-/** 全部大文字で 5 字以内（数字を含んでよい。先頭は英字）。ユーザー辞書への登録を断るのに使う（server.ts） */
+/** 全部大文字で 5 字以内（数字を含んでよい。先頭は英字） */
 export const isAcronym = (word: string): boolean => /^[A-Z][A-Z0-9]{0,4}$/.test(word);
 
 /** 全部大文字で 3 字以内（API, GPU）。ZEN-TTS が綴りで読むので未知語の候補にしない */

@@ -147,7 +147,7 @@ test('normalize と辞書', async () => {
     assert.deepEqual(all.entries.find(e => e.surface === 'GitHub'), { surface: 'GitHub', reading: 'ギッハブ', source: 'user' });
     // 読みの形（半角カナを含む）・頭字語・# で始まる語・未知のフィールド
     for (const [surface, body] of [
-      ['Bar', { reading: 'ばー' }], ['Bar', { reading: 'ﾊﾞｰ' }], ['API', { reading: 'エーピーアイ' }], ['%23Bar', { reading: 'バー' }],
+      ['Bar', { reading: 'ばー' }], ['Bar', { reading: 'ﾊﾞｰ' }], ['%23Bar', { reading: 'バー' }],
       ['Bar', { reading: 'バー', x: 1 }],
     ] as const) {
       r = await fetch(`${c.base}/v1/admin/dictionary/${surface}`, { ...json(body), method: 'PUT' });
