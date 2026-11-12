@@ -25,6 +25,8 @@ export type ModelRecord = {
 };
 
 export const MODEL_ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+/** 登録できるモデルの数（全エンジンの合計） */
+export const MAX_MODELS = 50;
 
 export class Registry {
   readonly dataDir: string;

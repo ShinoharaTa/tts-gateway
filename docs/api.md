@@ -3,10 +3,13 @@
 機械可読な仕様は [`openapi.yaml`](../openapi.yaml)（OpenAPI 3.1）。両者の内容は一致させる（食い違いはバグ）。
 
 - ベース URL: `http://<host>:<port>`（既定ポート 8710）
-- 文字コード: UTF-8。リクエスト本文は `Content-Type: application/json` のみ受け付ける（それ以外は 415）。
-- 認証: 環境変数 `TTS_TOKEN` を設定したときだけ、`/healthz` と設定画面の静的ファイル（`/admin/`。画面で入力したトークンを API の呼び出しに付ける）以外で `Authorization: Bearer <TTS_TOKEN>` が必須。
+- 文字コード: UTF-8。リクエスト本文は `Content-Type: application/json` のみ受け付ける（それ以外は 415）。JSON を受ける `POST` / `PUT` は本文が空でも `Content-Type` が違えば 415。本文の上限は 1MB（超えたら 400）。
+- 認証: 環境変数 `TTS_TOKEN` を設定したときだけ、`/healthz` と設定画面の静的ファイル（`/admin/`。画面で入力したトークンを API の呼び出しに付ける）以外で `Authorization: Bearer <TTS_TOKEN>` が必須。`TTS_ADMIN_TOKEN` でも通る。
   `/v1/admin/*` は `TTS_ADMIN_TOKEN` を設定したときだけ、その値が必須（未設定なら `TTS_TOKEN` の規則に従う）。
+  認証はパスの有無より先に行う（トークンが要る構成では、未定義のパス・未対応のメソッドも未認証なら 401）。
 - 接続元: `TTS_ALLOW_CIDRS` に入らない接続元は 403（`forbidden`）。
+- Host: `Host` ヘッダが `TTS_HOSTS` の各アドレス:`TTS_PORT`（IPv6 は `[::1]:8710` の形。ポート 80 ならポート無しも可）、`127.0.0.1`・`::1` で待ち受けるときの `localhost:<port>`、`TTS_ALLOWED_HOSTS` のホスト名（ポートは問わない）以外なら全パスで 421（`misdirected_request`）。DNS rebinding 対策。
+- Origin: `GET` / `HEAD` / `OPTIONS` 以外で `Origin` ヘッダがあり、その host（ポート含む）が上の Host の許可に入らなければ 403（`forbidden_origin`）。`Origin: null` も 403。`Origin` が無い要求（curl など）は通す。
 - CORS ヘッダは返さない（別オリジンのブラウザからは呼べない。JSON 必須と合わせて CSRF 対策）。
 
 ## エラー形式
@@ -17,15 +20,19 @@
 
 | HTTP | code | 意味 |
 |---|---|---|
-| 400 | `invalid_request` | パラメータ不正（範囲外・型違い・未知のフィールド・そのエンジンが対応しないオプション） |
+| 400 | `invalid_request` | パラメータ不正（範囲外・型違い・未知のフィールド・そのエンジンが対応しないオプション・本文が 1MB 超） |
+| 400 | `bad_request` | リクエストターゲットが解釈できない（`GET //` など） |
 | 401 | `unauthorized` | トークンが無い・違う |
 | 403 | `forbidden` | 接続元が許可リスト外 |
+| 403 | `forbidden_origin` | `Origin` が許可外・`null`（`GET` / `HEAD` / `OPTIONS` 以外） |
 | 404 | `not_found` | エンジン・声・モデル・パスが無い |
-| 409 | `conflict` | 同じ id のモデルがある・ダウンロード中 など |
+| 405 | `method_not_allowed` | パスはあるがメソッドが違う。`Allow` ヘッダ付き |
+| 409 | `conflict` | 同じ id のモデルがある・ダウンロード中（取得の要求が重なった）・削除の処理中 など |
 | 413 | `text_too_long` | `text` が上限（`TTS_MAX_CHARS`、既定 2,000 字）を超えた。または前処理と読み辞書を通した後の文が上限の 3 倍（既定 6,000 字）を超えた |
-| 415 | `unsupported_media_type` | JSON 以外の本文 |
+| 415 | `unsupported_media_type` | JSON 以外の本文（JSON を受ける `POST` / `PUT` は本文が空でも） |
+| 421 | `misdirected_request` | `Host` ヘッダが許可外・無い |
 | 422 | `model_not_installed` | 声は登録済みだが重みが未取得 |
-| 429 | `queue_full` | 待ち行列が満杯。`Retry-After` ヘッダ（秒）付き |
+| 429 | `queue_full` | 待ち行列が満杯・同時ダウンロードが上限（2 件）。`Retry-After` ヘッダ（秒）付き |
 | 500 | `internal_error` | 想定外の失敗 |
 | 503 | `engine_unavailable` | モデル読み込み・合成プロセスの失敗 |
 | 504 | `timeout` | 合成が時間内（既定 60 秒）に終わらなかった |
@@ -34,9 +41,9 @@
 
 ---
 
-## GET /healthz
+## GET /healthz（HEAD も可）
 
-モデルを読まずに返す。認証不要。
+モデルを読まずに返す。認証不要。`HEAD` は 200 で本文なし。
 
 ```json
 { "status": "ok", "version": "0.1.0" }
@@ -238,18 +245,22 @@ curl -sS -X POST http://127.0.0.1:8710/v1/synthesize \
 ```
 
 - `catalog: "kikka"` だけを送るとカタログの値で登録する（`{ "engine": "zen-tts", "catalog": "kikka" }`）。
-- `id`: `^[a-z0-9][a-z0-9_-]{0,31}$`。同じエンジンに同じ id があれば 409。
-- `url`: `https://` のみ。ホストは `TTS_MODEL_HOSTS`（既定 `tts-models.zenryoku.work,huggingface.co,hf.co`）のどれか、またはそのサブドメインであること。リダイレクト先も同じ規則で検査する。上限 `TTS_MODEL_MAX_MB`（既定 512MB）。
+- `id`: `^[a-z0-9][a-z0-9_-]{0,31}$`。同じエンジンに同じ id があれば 409（その id を削除の処理中も 409）。
+- `url`: `https://` のみ、ポートは 443 のみ（省略か明示の `:443`。ほかは 400）。ホストは `TTS_MODEL_HOSTS`（既定 `tts-models.zenryoku.work,huggingface.co,hf.co`）のどれか、またはそのサブドメインであること。リダイレクト先も同じ規則（ホスト・ポート）で検査する。リダイレクトは最大 5 回。上限 `TTS_MODEL_MAX_MB`（既定 512MB）。
+- 時間の上限: 1 件の取得の全体で `TTS_MODEL_TIMEOUT_SEC`（既定 600 秒）、無通信が 30 秒。超えたら `error` にして途中のファイルを消す。
+- 書き込みに失敗したとき（ディスクの空き不足・権限など）も `error` にして途中のファイルを消す。
+- 登録は全エンジンの合計 50 件まで（超える追加は 400）。
+- 同時ダウンロードは 2 件まで。超えたら 429（`Retry-After: 5`）で、登録しない。
 - `sha256`: 任意。指定したら一致しないと `error`。省略したら取得したファイルの値を記録する（以後の再取得はその値で検査する）。
 - 取得後、エンジンで読み込めるか検査する（ZEN-TTS: `.ztm` のヘッダと読み込み）。失敗なら `error` にしてファイルを消す。
 
 ### POST /v1/admin/models/{engine}/{id}/download
 
-`pending` / `error` のモデルを取り直す。`202`。
+`pending` / `error` のモデルを取り直す。`202`。同じ id の取得が重なったら 2 つ目は 409、削除の処理中も 409。同時ダウンロードが 2 件なら 429（`Retry-After: 5`）。
 
 ### DELETE /v1/admin/models/{engine}/{id}
 
-登録と重みのファイルを消す。既定の声に設定されているものは 409。ダウンロード中なら中止して消す。`204`。
+登録と重みのファイルを消す。既定の声に設定されているものは 409。ダウンロード中なら中止し、途中のファイル（`.part`）が消えるのを待ってから消す。その間に来た同じ id の追加・取り直しは 409。`204`。
 
 ### PUT /v1/admin/dictionary/{surface} / DELETE /v1/admin/dictionary/{surface}
 

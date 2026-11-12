@@ -82,7 +82,7 @@ The server listens only on `127.0.0.1` by default. To serve other machines, set 
 
 - `TTS_HOSTS`: the addresses to listen on
 - `TTS_ALLOW_CIDRS`: the client networks that may connect
-- `TTS_TOKEN` and `TTS_ADMIN_TOKEN`: the API tokens
+- `TTS_TOKEN` and `TTS_ADMIN_TOKEN`: the API tokens (required when `TTS_HOSTS` has a non-loopback address; the server refuses to start without one)
 
 The server does not handle TLS, so keep it behind a VPN or a reverse proxy. See [docs/deployment.md](docs/deployment.md).
 
