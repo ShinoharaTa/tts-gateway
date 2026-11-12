@@ -11,6 +11,7 @@
  *   4. 他のスロットが読み込んでいない声の最も古い要求
  *   5. 先頭
  *   取った要求より前にあった要求は「追い越された」とし、最初に追い越された時刻を覚える
+ *   空きスロットが複数あり、どれも要求の声を持っていなければ、未読み込みのスロット → 最後に割り当てた時刻が最も古いスロットの順
  */
 import { performance } from 'node:perf_hooks';
 import { ApiError } from './errors.ts';
@@ -35,7 +36,8 @@ type Job<T> = {
   reject: (e: unknown) => void;
 };
 
-type Slot = { busy: boolean; voice: string | undefined };
+/** lastUsedAt: 最後に要求を割り当てた時刻（未使用は -Infinity） */
+type Slot = { busy: boolean; voice: string | undefined; lastUsedAt: number };
 
 export class SynthQueue {
   concurrency: number;
@@ -93,7 +95,7 @@ export class SynthQueue {
   }
 
   private next(): void {
-    while (this.slots.length < this.concurrency) this.slots.push({ busy: false, voice: undefined });
+    while (this.slots.length < this.concurrency) this.slots.push({ busy: false, voice: undefined, lastUsedAt: -Infinity });
     while (this.running < this.concurrency && this.waiting.length > 0) {
       const [slotIndex, jobIndex] = this.pick();
       const slot = this.slots[slotIndex]!;
@@ -102,6 +104,7 @@ export class SynthQueue {
       const job = this.waiting.splice(jobIndex, 1)[0]!;
       slot.busy = true;
       slot.voice = job.voice;
+      slot.lastUsedAt = now;
       this.running++;
       void (async () => {
         try {
@@ -122,8 +125,12 @@ export class SynthQueue {
     const free = this.slots.flatMap((s, i) => (i < this.concurrency && !s.busy ? [i] : []));
     if (this.concurrency <= 1) return [free[0]!, 0];
     const head = this.waiting[0]!;
+    // 声を持っていない空きスロット → 最後に割り当てた時刻が最も古い空きスロット（同時刻なら番号の小さい方）
+    const spare = (): number =>
+      free.find(i => this.slots[i]!.voice === undefined) ??
+      free.reduce((a, i) => (this.slots[i]!.lastUsedAt < this.slots[a]!.lastUsedAt ? i : a));
     // 空きが複数なら、その声を読み込んでいるスロットを優先する
-    const slotFor = (voice: string | undefined): number => free.find(i => this.slots[i]!.voice === voice) ?? free[0]!;
+    const slotFor = (voice: string | undefined): number => free.find(i => this.slots[i]!.voice === voice) ?? spare();
     const now = this.now();
     if (now - head.queuedAt >= this.priorityAfterMs) return [slotFor(head.voice), 0];
     const expired = this.waiting.findIndex(w => w.overtakenAt !== undefined && now - w.overtakenAt >= this.affinityMaxWaitMs);
@@ -134,7 +141,7 @@ export class SynthQueue {
       const j = this.waiting.findIndex(w => w.voice === voice);
       if (j >= 0) return [i, j];
     }
-    const slot = free[0]!;
+    const slot = spare();
     const others = new Set(this.slots.flatMap((s, i) => (i !== slot && s.voice !== undefined ? [s.voice] : [])));
     const j = this.waiting.findIndex(w => w.voice === undefined || !others.has(w.voice));
     return [slot, j >= 0 ? j : 0];

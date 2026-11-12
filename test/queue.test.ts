@@ -231,3 +231,30 @@ test('1 スロットは声に関係なく FIFO', async () => {
   await Promise.all(runs);
   assert.deepEqual(started, ['A0@0', 'B1@0', 'A2@0', 'B3@0']);
 });
+
+test('2 スロット: 声を持っていない空きスロットを優先し、A と B の交互で声を入れ替えない', async () => {
+  let now = 0;
+  const q = new SynthQueue({ concurrency: 2, max: 8, now: () => now });
+  const started: string[] = [];
+  const one = (name: string, voice: string) =>
+    q.run(undefined, async slot => {
+      started.push(`${name}@${slot}`);
+    }, voice).promise;
+  // A を 1 件 → 終わってから B を 1 件。B はスロット 0（A）を追い出さず、未読み込みのスロット 1 へ
+  await one('a1', 'A');
+  now = 100;
+  await one('b1', 'B');
+  assert.deepEqual(started, ['a1@0', 'b1@1']);
+  // 以後、A と B の交互でも各声は同じスロットに載る
+  for (let i = 2; i <= 4; i++) {
+    now += 100;
+    await one(`a${i}`, 'A');
+    now += 100;
+    await one(`b${i}`, 'B');
+  }
+  assert.deepEqual(started.slice(2), ['a2@0', 'b2@1', 'a3@0', 'b3@1', 'a4@0', 'b4@1']);
+  // どちらも声を持っていない C は、最後に割り当てた時刻が古いスロット 0（A）へ
+  now += 100;
+  await one('c1', 'C');
+  assert.deepEqual(started.slice(-1), ['c1@0']);
+});
