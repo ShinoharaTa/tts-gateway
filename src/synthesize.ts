@@ -5,7 +5,7 @@
 import { createHash } from 'node:crypto';
 import { ApiError, invalid, notFound } from './errors.ts';
 import type { AudioCache } from './cache.ts';
-import { CONTENT_TYPES, DEFAULT_BITRATES, encode, ffmpegUnavailable, needsFfmpeg, outputSampleRate } from './audio/encode.ts';
+import { CONTENT_TYPES, DEFAULT_BITRATES, encode, ffmpegUnavailable, needsFfmpeg, outputSampleRate, type FfmpegProbe } from './audio/encode.ts';
 import { applyGain, concat, samplesToMs, silence, trimSilence } from './audio/pcm.ts';
 import type { Engine } from './engines/types.ts';
 import type { ModelRecord, Registry } from './models/registry.ts';
@@ -174,8 +174,8 @@ export type SynthesizerDeps = {
   maxChars: number;
   timeoutSec: number;
   ffmpeg: string;
-  /** 起動時の `ffmpeg -version` が通ったか（省略時は使える扱い）。false なら ffmpeg の要る要求を起動せずに 503 */
-  ffmpegAvailable?: boolean;
+  /** ffmpeg の有無（省略時は使える扱い）。使えなければ ffmpeg の要る要求を起動せずに 503 */
+  ffmpegProbe?: FfmpegProbe;
 };
 
 export class Synthesizer {
@@ -242,8 +242,9 @@ export class Synthesizer {
         };
     }
 
-    if (this.d.ffmpegAvailable === false && needsFfmpeg(params.format, params.sampleRate, engine.sampleRate))
-      throw ffmpegUnavailable(this.d.ffmpeg);
+    if (this.d.ffmpegProbe && needsFfmpeg(params.format, params.sampleRate, engine.sampleRate)) {
+      if (!(await this.d.ffmpegProbe.get()).available) throw ffmpegUnavailable(this.d.ffmpeg);
+    }
 
     // キャッシュを使わない要求は合流しない（毎回作る）
     const { promise } = this.d.queue.run(useCache ? key : undefined, async () => {

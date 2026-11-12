@@ -96,7 +96,7 @@ const loadStatus = async () => {
       ['サーバーのメモリ', mb(s.memory.rssBytes)],
       ['合成中 / 待ち', `${s.queue.running} / ${s.queue.waiting}（上限 ${s.queue.max}）`],
       ['キャッシュ', `${s.cache.entries} 件・${mb(s.cache.bytes)}`],
-      ['ffmpeg', s.ffmpeg.available ? (s.ffmpeg.version ?? 'あり') : 'なし（wav のみ）'],
+      ['ffmpeg', s.ffmpeg.available ? (s.ffmpeg.version ?? 'あり') : 'なし（wav だけ使えます）'],
     ];
     $('status').replaceChildren(...items.map(([k, v]) => h('div', {}, h('dt', {}, k), h('dd', {}, v))));
     setMsg('status-msg', '');

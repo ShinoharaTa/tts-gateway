@@ -9,7 +9,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFile, rm } from 'node:fs/promises';
 import type { IncomingMessage, RequestListener, ServerResponse } from 'node:http';
 import { join } from 'node:path';
-import { probeFfmpeg, type FfmpegStatus } from './audio/encode.ts';
+import { FfmpegProbe } from './audio/encode.ts';
 import { AudioCache } from './cache.ts';
 import { VERSION, type Config } from './config.ts';
 import { createEngines, MODEL_EXTS, type EngineDeps } from './engines/index.ts';
@@ -36,8 +36,8 @@ export type App = {
   catalog: CatalogModel[];
   downloader: ModelDownloader;
   synth: Synthesizer;
-  /** 起動時に確かめた ffmpeg の有無 */
-  ffmpeg: FfmpegStatus;
+  /** ffmpeg の有無（30 秒たてば確かめ直す） */
+  ffmpeg: FfmpegProbe;
   startedAt: number;
   close: () => Promise<void>;
 };
@@ -72,10 +72,11 @@ export const createApp = async (config: Config, o: AppOverrides = {}): Promise<A
     protocols: o.protocols,
   });
   // ffmpeg が無くても起動は続ける（wav はそのまま返せる）
-  const ffmpeg = await probeFfmpeg(config.ffmpeg);
+  const ffmpeg = new FfmpegProbe(config.ffmpeg);
+  await ffmpeg.get();
   const synth = new Synthesizer({
     engines, registry, settings, cache, queue, dictionary,
-    maxChars: config.maxChars, timeoutSec: config.timeoutSec, ffmpeg: config.ffmpeg, ffmpegAvailable: ffmpeg.available,
+    maxChars: config.maxChars, timeoutSec: config.timeoutSec, ffmpeg: config.ffmpeg, ffmpegProbe: ffmpeg,
   });
   settings.onChange(() => {
     void cache.evict().catch(e => console.error(`cache evict failed: ${(e as Error).message}`));
@@ -218,13 +219,13 @@ const enginesJson = (app: App): unknown => {
   };
 };
 
-const statusJson = (app: App): unknown => ({
+const statusJson = async (app: App): Promise<unknown> => ({
   version: VERSION,
   uptimeSec: Math.floor((Date.now() - app.startedAt) / 1000),
   engines: [...app.engines.values()].map(e => e.status()),
   queue: app.queue.stats(),
   cache: app.cache.stats(),
-  ffmpeg: app.ffmpeg,
+  ffmpeg: await app.ffmpeg.get(),
   memory: { rssBytes: process.memoryUsage.rss() },
 });
 
@@ -367,7 +368,7 @@ const routes: Route[] = [
     method: 'GET', re: /^\/v1\/admin\/status$/, admin: true, auth: true,
     run: async (app, req, res) => {
       await noBody(req);
-      sendJson(res, 200, statusJson(app));
+      sendJson(res, 200, await statusJson(app));
     },
   },
   {

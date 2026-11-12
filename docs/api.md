@@ -178,13 +178,14 @@ curl -sS -X POST http://127.0.0.1:8710/v1/synthesize \
   "engines": [{ "id": "zen-tts", "loaded": "marine", "kernel": "wasm", "process": { "pid": 1234, "rssBytes": 300000000 }, "idleUnloadSec": 600 }],
   "queue": { "running": 1, "waiting": 0, "max": 8, "concurrency": 1 },
   "cache": { "entries": 12, "bytes": 1048576, "maxBytes": 524288000 },
-  "ffmpeg": { "available": true, "path": "ffmpeg", "version": "7.0.2" },
+  "ffmpeg": { "available": true, "path": "ffmpeg", "version": "7.0.2", "reason": null },
   "memory": { "rssBytes": 80000000 }
 }
 ```
 
-`ffmpeg` は起動時に `FFMPEG -version` を 1 回試した結果（`path` は `FFMPEG` の値、`version` は出力の 1 行目から取った版、取れなければ `null`）。
-`available` が `false` なら、ffmpeg の要る要求は ffmpeg を起動せずに 503 `engine_unavailable` を返す（起動後に入れても再起動するまで変わらない）。
+`ffmpeg` は `FFMPEG -version` を試した結果（`path` は `FFMPEG` の値、`version` は出力の 1 行目から取った版、取れなければ `null`、`reason` は使えない理由、使えれば `null`）。
+起動時に 1 回試し、その後は状態取得・ffmpeg の要る要求のときに前回から 30 秒以上たっていれば試し直す（起動後に入れても 30 秒以内に反映される）。
+`available` が `false` なら、ffmpeg の要る要求は ffmpeg を起動せずに 503 `engine_unavailable` を返す。
 
 ### GET /v1/admin/settings / PUT /v1/admin/settings
 
@@ -280,6 +281,7 @@ curl -sS -X POST http://127.0.0.1:8710/v1/synthesize \
 キーは sha256(エンジン id・版、声 id とモデルの sha256、前処理・辞書を通した後の文、音声に効くすべてのパラメータ、出力形式)。
 辞書を変えても、その文の読みが変わらなければヒットする。保存先 `TTS_CACHE_DIR`（既定 `~/.cache/tts-gateway/audio`）。
 `cacheMaxMB` を超えたら最終アクセスの古い順に消す。`cacheTtlDays` を過ぎたものも消す。
+キャッシュに当たった要求は、ffmpeg が無くても 200 を返す。
 
 ## 同時実行
 

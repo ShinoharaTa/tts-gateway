@@ -1049,8 +1049,8 @@ components:
         ffmpeg:
           type: object
           additionalProperties: false
-          required: [available, path, version]
-          description: 起動時に `-version` を 1 回試した結果。available が false なら ffmpeg の要る要求は 503
+          required: [available, path, version, reason]
+          description: '`-version` を試した結果。起動時に試し、前回から 30 秒以上たっていれば状態取得・ffmpeg の要る要求のときに試し直す。available が false なら ffmpeg の要る要求は 503'
           properties:
             available:
               type: boolean
@@ -1061,6 +1061,10 @@ components:
               type: [string, 'null']
               description: 出力の 1 行目から取った版
               examples: ['7.0.2']
+            reason:
+              type: [string, 'null']
+              description: 使えない理由。使えれば null
+              examples: ['spawn /usr/bin/ffmpeg ENOENT']
         memory:
           type: object
           additionalProperties: false
