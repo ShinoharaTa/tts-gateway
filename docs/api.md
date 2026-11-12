@@ -28,7 +28,7 @@
 | 422 | `unprocessable_text` | 読み上げられない長さの語が含まれる（1 回の合成の上限を超える文を割り直しても収まらない） |
 | 429 | `queue_full` | 待ち行列が満杯。`Retry-After` ヘッダ（秒）付き |
 | 500 | `internal_error` | 想定外の失敗 |
-| 503 | `engine_unavailable` | モデル読み込み・合成プロセスの失敗 |
+| 503 | `engine_unavailable` | モデル読み込み・合成プロセスの失敗。ffmpeg が無い（起動できない）ときに ffmpeg の要る要求（`wav` 以外、またはリサンプルの要る `wav`）。ffmpeg が 30 秒で終わらない（`timed out`）。待ち行列での待ちが `TTS_TIMEOUT_SEC` を超えた（`Retry-After` ヘッダ付き） |
 | 504 | `timeout` | 合成が時間内（既定 60 秒）に終わらなかった |
 
 **未知のフィールドは 400**（打ち間違いを黙って無視しない）。
@@ -81,7 +81,7 @@
 | `voice` | string | エンジンの既定 | `voices[].id` |
 | `format` | string | `wav` | `wav`（16bit PCM）/ `mp3` / `opus`（Ogg）/ `m4a`（AAC）/ `flac` |
 | `sampleRate` | integer | エンジンの値 | 出力のサンプルレート。`8000` `16000` `22050` `24000` `44100` `48000` のいずれか。`opus` は Opus が扱えない `22050`・`44100` を `48000` で書く（`X-Sample-Rate` は実際の値） |
-| `bitrate` | string | `mp3`:`128k` `opus`:`48k` `m4a`:`64k` | 圧縮形式のビットレート（`16k`〜`320k`）。`wav`・`flac` では指定すると 400 |
+| `bitrate` | string | `mp3`:`128k` `opus`:`48k` `m4a`:`64k` | 圧縮形式のビットレート（`<数>k`）。範囲は `opus` `6k`〜`256k`、`mp3` `8k`〜`320k`、`m4a` `8k`〜`320k`。範囲外・`wav`・`flac` で指定すると 400（`field: bitrate`） |
 | `volume` | number | `0` | 音量の増減（dB、`-20`〜`+12`）。クリップしないよう ±1 に丸める |
 | `sentencePauseMs` | integer | `250` | 文と文の間の無音（ms、`0`〜`3000`） |
 | `leadingSilenceMs` | integer | `0` | 先頭に足す無音（ms、`0`〜`3000`） |
@@ -119,6 +119,12 @@ curl -sS -X POST http://127.0.0.1:8710/v1/synthesize \
   -o out.mp3
 ```
 
+### 中断と待ち
+
+- 応答を受け取る前にクライアントが接続を切ると、その要求の合成（待ち行列での待ち・エンジン・ffmpeg）を止め、応答は書かない。止めた合成はキャッシュに書かない。
+  同じ合成を複数の要求が待っている（合流）ときは、待っている要求が 1 つでも残っていれば続ける（全員が切ったときだけ止める）。
+- 待ち行列に入ってから合成が始まるまでが `TTS_TIMEOUT_SEC` を超えたら 503 `engine_unavailable`（`Retry-After: 5`）。合成そのものの上限（504）は始まってから数える。
+
 ### レスポンス
 
 - `200`、本文は音声。`Content-Type`: `audio/wav` / `audio/mpeg` / `audio/ogg` / `audio/mp4` / `audio/flac`
@@ -137,7 +143,8 @@ curl -sS -X POST http://127.0.0.1:8710/v1/synthesize \
 
 ## POST /v1/normalize
 
-合成せずに、前処理と読み辞書を通した後の文を返す。リクエストは `/v1/synthesize` と同じ（音声関係のフィールドは無視せず検証だけする）。
+合成せずに、前処理と読み辞書を通した後の文を返す。リクエストは `/v1/synthesize` と同じ（音声関係のフィールド・`zenTts` などエンジン固有のオプションも無視せず同じ規則で検証する）。
+`sentences` は合成と同じ分け方: `maxSentenceChars` とエンジンの上限（ZEN-TTS で `zenTts.speed` < 1 なら `120 × speed` 字）の小さい方で切る。
 
 ```json
 {
@@ -186,12 +193,17 @@ curl -sS -X POST http://127.0.0.1:8710/v1/synthesize \
   }],
   "queue": { "running": 1, "waiting": 0, "max": 8, "concurrency": 2 },
   "cache": { "entries": 12, "bytes": 1048576, "maxBytes": 524288000 },
+  "ffmpeg": { "available": true, "path": "ffmpeg", "version": "7.0.2", "reason": null },
   "memory": { "rssBytes": 80000000 }
 }
 ```
 
 `loaded`・`kernel`・`process` は合成プロセス 1 つ分（互換のため残している）。`processes` はスロット（`TTS_CONCURRENCY` 個）ごとの合成プロセスで、
 `state` は `starting`（声の読み込み中）・`idle`・`busy`（合成中）。`rssBytes` は取れなければ `null`。プロセスの無いスロットは載らない。
+
+`ffmpeg` は `FFMPEG -version` を試した結果（`path` は `FFMPEG` の値、`version` は出力の 1 行目から取った版、取れなければ `null`、`reason` は使えない理由、使えれば `null`）。
+起動時に 1 回試し、その後は状態取得・ffmpeg の要る要求のときに前回から 30 秒以上たっていれば試し直す（起動後に入れても 30 秒以内に反映される）。
+`available` が `false` なら、ffmpeg の要る要求は ffmpeg を起動せずに 503 `engine_unavailable` を返す。
 
 ### GET /v1/admin/settings / PUT /v1/admin/settings
 
@@ -287,6 +299,7 @@ curl -sS -X POST http://127.0.0.1:8710/v1/synthesize \
 キーは sha256(エンジン id・版、声 id とモデルの sha256、前処理・辞書を通した後の文、音声に効くすべてのパラメータ、出力形式)。
 辞書を変えても、その文の読みが変わらなければヒットする。保存先 `TTS_CACHE_DIR`（既定 `~/.cache/tts-gateway/audio`）。
 `cacheMaxMB` を超えたら最終アクセスの古い順に消す。`cacheTtlDays` を過ぎたものも消す。
+キャッシュに当たった要求は、ffmpeg が無くても 200 を返す。
 
 ## 同時実行
 

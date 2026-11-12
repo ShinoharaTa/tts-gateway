@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { ApiError } from '../src/errors.ts';
 import { samplesToMs } from '../src/audio/pcm.ts';
-import { SentenceTooLongError } from '../src/engines/types.ts';
+import { SentenceTooLongError, type Engine } from '../src/engines/types.ts';
 import { ZEN_TTS_VERSION, ZenTtsEngine } from '../src/engines/zen-tts/engine.ts';
 import type { Registry } from '../src/models/registry.ts';
 import { SynthQueue } from '../src/queue.ts';
@@ -228,6 +228,46 @@ test(`${MAX_SPLIT_DEPTH} 段割っても、1 文字まで割っても上限を�
   } finally {
     await engine.close();
   }
+});
+
+test('割り直した片のエンジン呼び出しにも slot と signal が届き、中断されたら割り直しを続けない', async () => {
+  const calls: { sentence: string; slot: number; signal: AbortSignal }[] = [];
+  let abortAt = Infinity;
+  const ac = new AbortController();
+  const reason = new Error('client disconnected');
+  // 4 字を超える文は上限超過。abortAt 回目の呼び出しで中断する
+  const engine = {
+    synthesize: async (sentence: string, _v: unknown, _o: unknown, signal: AbortSignal, slot: number) => {
+      calls.push({ sentence, slot, signal });
+      if (calls.length === abortAt) ac.abort(reason);
+      if ([...sentence].length > 4) throw new SentenceTooLongError('too long');
+      return new Float32Array([...sentence].map(c => c.codePointAt(0)!));
+    },
+  } as unknown as Engine;
+  const o = { engine, voice: voice('echo'), options: {}, signal: ac.signal, slot: 1 };
+  assert.equal(echoed(await synthesizeSentence(o, 'あいうえおかきく')), 'あいうえおかきく');
+  assert.deepEqual(calls.map(c => [c.sentence, c.slot, c.signal === ac.signal]), [
+    ['あいうえおかきく', 1, true], ['あいうえ', 1, true], ['おかきく', 1, true],
+  ]);
+  // 上限超過と同時に中断: 割り直さずに中断の理由で失敗する
+  calls.length = 0;
+  abortAt = 1;
+  await assert.rejects(synthesizeSentence(o, 'あいうえおかきく'), (e: unknown) => e === reason);
+  assert.equal(calls.length, 1);
+  // 片の合成の途中で中断: 残りの片は合成しない
+  const ac2 = new AbortController();
+  calls.length = 0;
+  abortAt = Infinity;
+  const engine2 = {
+    synthesize: async (sentence: string, _v: unknown, _o: unknown, signal: AbortSignal, slot: number) => {
+      calls.push({ sentence, slot, signal });
+      if (calls.length === 2) ac2.abort(reason);
+      if ([...sentence].length > 4) throw new SentenceTooLongError('too long');
+      return new Float32Array([...sentence].length);
+    },
+  } as unknown as Engine;
+  await assert.rejects(synthesizeSentence({ ...o, engine: engine2, signal: ac2.signal }, 'あいうえおかきく'), (e: unknown) => e === reason);
+  assert.deepEqual(calls.map(c => c.sentence), ['あいうえおかきく', 'あいうえ']);
 });
 
 test('読み込み中に中断しても、読み込み後に idleUnloadSec で子が終了する', async () => {

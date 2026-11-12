@@ -15,7 +15,7 @@
 | `TTS_AFFINITY_MAX_WAIT_MS` | `5000` | `TTS_CONCURRENCY=2` のとき、同じ声の要求に追い越された要求が、最初に追い越されてから待つ上限（ミリ秒、0〜60000）。過ぎたら声が違っても次の空きスロットで合成する。待ち行列に入ってから 15 秒たった要求は、これに関係なく最優先 |
 | `TTS_QUEUE_MAX` | `8` | 待ち行列の上限。超えたら 429 |
 | `TTS_MAX_CHARS` | `2000` | `text` の上限（字）。超えたら 413 |
-| `TTS_TIMEOUT_SEC` | `60` | 1 要求の合成の上限（秒）。超えたら 504 |
+| `TTS_TIMEOUT_SEC` | `60` | 1 要求の合成の上限（秒、合成が始まってから）。超えたら 504。待ち行列での待ちもこの秒数まで（超えたら 503、`Retry-After: 5`） |
 | `TTS_MODEL_HOSTS` | `tts-models.zenryoku.work,huggingface.co,hf.co` | モデルを取得してよいホスト（サブドメインも可。リダイレクト先も検査） |
 | `TTS_MODEL_MAX_MB` | `512` | モデルの大きさの上限（MB） |
 | `FFMPEG` | `ffmpeg` | ffmpeg のパス |
