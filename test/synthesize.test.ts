@@ -136,7 +136,7 @@ test('renderAudio: 無音詰め・文間の無音・先頭と末尾の無音・�
   assert.equal(r2.audio.readInt16LE(44 + 400 * 2), 0x7fff);
 });
 
-const setup = async () => {
+const setup = async (o: { concurrency?: number; timeoutSec?: number } = {}) => {
   const { dir, cleanup } = await tempDir();
   const settings = await SettingsStore.load(join(dir, 'data'));
   const registry = await Registry.load(join(dir, 'data'), () => '.fake');
@@ -147,11 +147,12 @@ const setup = async () => {
   const cache = new AudioCache({ dir: join(dir, 'cache'), maxBytes: () => settings.get().cacheMaxMB * 1024 * 1024, ttlMs: () => 1e12 });
   await cache.init();
   const dictionary = await Dictionary.load(join(PACKAGE_DIR, 'dict', 'readings.tsv'), join(dir, 'data', 'readings.tsv'));
+  const queue = new SynthQueue({ concurrency: o.concurrency ?? 1, max: 8 });
   const synth = new Synthesizer({
-    engines: new Map([[engine.id, engine]]), registry, settings, cache, queue: new SynthQueue({ concurrency: 1, max: 8 }),
-    dictionary, maxChars: 2000, timeoutSec: 60, ffmpeg: 'false',
+    engines: new Map([[engine.id, engine]]), registry, settings, cache, queue,
+    dictionary, maxChars: 2000, timeoutSec: o.timeoutSec ?? 60, ffmpeg: 'false',
   });
-  return { synth, engine, settings, cleanup };
+  return { synth, engine, settings, registry, cache, queue, cleanup };
 };
 
 test('Synthesizer: 辞書を通した文を合成し、2 回目はキャッシュ、cache:false は bypass', async () => {
@@ -251,6 +252,87 @@ test('Synthesizer: normalize と synthesize は 前処理の前段 → 辞書 �
     assert.equal(n.sentences[0], spoken.split('\n')[0]);
     // 登録の無い 4 字以上の大文字語は未知語。3 字以内は出ない
     assert.deepEqual(synth.normalize({ text: 'NASA の API' }).unknownWords, [{ word: 'NASA', count: 1 }]);
+  } finally {
+    await cleanup();
+  }
+});
+
+test('Synthesizer: 2 スロットで声 A/B が交互に来ても、スロットごとに同じ声を流して読み直さない', async () => {
+  const { synth, engine, registry, cleanup } = await setup({ concurrency: 2 });
+  try {
+    await registry.add(installedModel('zen-tts', 'kai'));
+    engine.delayMs = 20;
+    // A は 2 文・B は 1 文（B が先に終わる）。FIFO なら空いたスロットに次の A が入って読み直しが起きる
+    const reqs = [0, 1, 2, 3, 4, 5, 6, 7].map(i =>
+      i % 2 === 0
+        ? synth.synthesize({ text: `いち${i}。に${i}。`, voice: 'marine', cache: false })
+        : synth.synthesize({ text: `さん${i}。`, voice: 'kai', cache: false }),
+    );
+    await Promise.all(reqs);
+    assert.equal(engine.calls.length, 4 * 2 + 4);
+    // スロットごとの声の並び（同じ声が続けば 1 つにまとめる）
+    const runs = (slot: number) =>
+      engine.calls.filter(c => c.slot === slot).map(c => c.voice).filter((v, i, a) => v !== a[i - 1]);
+    // 両方の声が待っている間はスロットが声を保つ。B が尽きた後は空いたスロット 1 が残りの A を取る（規則 4）
+    assert.deepEqual(runs(0), ['marine']);
+    assert.deepEqual(runs(1), ['kai', 'marine']);
+    // FIFO なら B が先に空けたスロットへ次の A、A が空けたスロットへ次の B が入り、ほぼ毎回読み直す
+    assert.equal(engine.loads, 3);
+  } finally {
+    await cleanup();
+  }
+});
+
+test('Synthesizer.normalize: 文分割にエンジンの sentenceCharLimit を使う（zenTts.speed を受ける）', async () => {
+  const { synth, engine, cleanup } = await setup();
+  try {
+    const limit = (opts: Record<string, unknown>): number => Math.floor(120 * Math.min(1, (opts.speed as number | undefined) ?? 1));
+    Object.assign(engine, { sentenceCharLimit: limit });
+    const text = 'か'.repeat(100);
+    assert.deepEqual(synth.normalize({ text }).sentences, [text]);
+    assert.deepEqual(synth.normalize({ text, zenTts: { speed: 0.5 } }).sentences, ['か'.repeat(60), 'か'.repeat(40)]);
+    // maxSentenceChars の方が小さければそちら
+    assert.deepEqual(synth.normalize({ text, maxSentenceChars: 50, zenTts: { speed: 0.5 } }).sentences, ['か'.repeat(50), 'か'.repeat(50)]);
+    assert.throws(() => synth.normalize({ text, zenTts: { speed: 0.4 } }), /speed/);
+  } finally {
+    await cleanup();
+  }
+});
+
+test('Synthesizer: 待ち行列で timeoutSec を超えて待った要求は 503（Retry-After 付き）、行列に残らない', async () => {
+  const { synth, engine, queue, cleanup } = await setup({ timeoutSec: 0.2 });
+  try {
+    let open!: () => void;
+    const busy = queue.run(undefined, () => new Promise<void>(r => (open = r)));
+    await assert.rejects(synth.synthesize({ text: 'こんにちは。' }), (e: unknown) => {
+      assert.ok(e instanceof ApiError);
+      assert.equal(e.status, 503);
+      assert.equal(e.retryAfterSec, 5);
+      return true;
+    });
+    assert.equal(queue.stats().waiting, 0);
+    open();
+    await busy.promise;
+    assert.equal(engine.calls.length, 0);
+  } finally {
+    await cleanup();
+  }
+});
+
+test('Synthesizer: signal の abort はエンジンに届き、中断した合成はキャッシュに書かない', async () => {
+  const { synth, engine, cleanup } = await setup();
+  try {
+    engine.delayMs = 200;
+    const ac = new AbortController();
+    const p = synth.synthesize({ text: 'こんにちは。' }, ac.signal);
+    await new Promise(r => setTimeout(r, 50));
+    ac.abort(new Error('client disconnected'));
+    await assert.rejects(p, /client disconnected/);
+    assert.equal(engine.signals.length, 1);
+    assert.equal(engine.signals[0]!.aborted, true);
+    // 中断の後でもキャッシュには無い
+    engine.delayMs = 0;
+    assert.equal((await synth.synthesize({ text: 'こんにちは。' })).cache, 'miss');
   } finally {
     await cleanup();
   }

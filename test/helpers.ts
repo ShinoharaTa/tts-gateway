@@ -17,7 +17,8 @@ export const tempDir = async (): Promise<{ dir: string; cleanup: () => Promise<v
 
 /**
  * 偽のエンジン。1 文につき「前 pad 個の無音 + 文字数 × perChar 個の 0.5 + 後 pad 個の無音」を返す。
- * calls に合成した文を記録する。delayMs で合成に時間をかけられる
+ * calls に合成した文、signals に渡された signal を記録する。delayMs で合成に時間をかけられる。
+ * スロットごとに最後の声を覚え、声が変わった（初回を含む）回数を loads に数える（合成プロセスの読み込みの代わり）
  */
 export class FakeEngine implements Engine {
   id: string;
@@ -27,7 +28,10 @@ export class FakeEngine implements Engine {
   credit = { ja: '音声合成：偽', en: 'Speech synthesis: Fake (https://example.com)', url: 'https://example.com' };
   modelExt = '.fake';
   optionsKey: string;
-  calls: { sentence: string; voice: string; opts: Record<string, unknown> }[] = [];
+  calls: { sentence: string; voice: string; opts: Record<string, unknown>; slot: number }[] = [];
+  signals: AbortSignal[] = [];
+  loads = 0;
+  private readonly slotVoices = new Map<number, string>();
   delayMs = 0;
   pad = 80;
   perChar = 10;
@@ -63,8 +67,13 @@ export class FakeEngine implements Engine {
     return { voiceId: 'fake' };
   }
 
-  async synthesize(sentence: string, voice: ModelRecord, opts: Record<string, unknown>, signal: AbortSignal): Promise<Float32Array> {
-    this.calls.push({ sentence, voice: voice.id, opts });
+  async synthesize(sentence: string, voice: ModelRecord, opts: Record<string, unknown>, signal: AbortSignal, slot = 0): Promise<Float32Array> {
+    this.calls.push({ sentence, voice: voice.id, opts, slot });
+    this.signals.push(signal);
+    if (this.slotVoices.get(slot) !== voice.id) {
+      this.slotVoices.set(slot, voice.id);
+      this.loads++;
+    }
     if (this.delayMs) {
       await new Promise<void>((resolve, reject) => {
         const t = setTimeout(resolve, this.delayMs);
@@ -81,7 +90,7 @@ export class FakeEngine implements Engine {
   }
 
   status(): EngineStatus {
-    return { id: this.id, loaded: null, kernel: null, process: null, idleUnloadSec: this.settings?.().idleUnloadSec ?? 0 };
+    return { id: this.id, loaded: null, kernel: null, process: null, processes: [], idleUnloadSec: this.settings?.().idleUnloadSec ?? 0 };
   }
 
   async close(): Promise<void> {}

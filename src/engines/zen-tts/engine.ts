@@ -2,23 +2,38 @@
  * ZEN-TTS エンジン（docs/design.md「ZEN-TTS エンジン」）。合成は child.ts を child_process.fork した子プロセスで行う
  * （worker_threads では解放しても RSS が戻らないため）。
  *
- * - 子プロセスは poolSize（TTS_CONCURRENCY）個まで。すべて同じ 1 つの声を読む
- * - 別の声の文が来たら、合成中の文が終わるのを待ってから子を全部終了し、その声で起動し直す（待ちは FIFO）
- * - idleUnloadSec 使われなければ子を全部終了してメモリを返す（0 は解放しない）
+ * - 子プロセスは poolSize（TTS_CONCURRENCY）個まで。待ち行列のスロット 1 つに子 1 つで、子ごとに 1 つの声を読む
+ *   （どのスロットにどの要求を流すかは queue.ts が決める）
+ * - そのスロットの子と別の声の文が来たら、その子を終了してその声で起動し直す（待ちは FIFO）
+ * - スロットごとに、idleUnloadSec 使われなければその子を終了してメモリを返す（0 は解放しない）
  * - 子が落ちたら合成中の文は 503。次の文で起動し直す。1 文 30 秒を超えたら子を終了して 504
+ * - 1 回の合成の上限（字数・音素数・フレーム数）を超えた文は SentenceTooLongError（子はそのまま使う。分割は synthesize.ts）
+ * - 子の error イベントは fork 直後から終了まで常に受ける（fork の失敗も 503。プロセスを落とさない）
  * - このファイルは zen-tts を読み込まない（読み込むのは子だけ。親のメモリを増やさない）
  */
 import { fork, type ChildProcess } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { ApiError, invalid } from '../../errors.ts';
 import type { ModelRecord, Registry } from '../../models/registry.ts';
 import type { Settings } from '../../settings.ts';
 import { checkBool, checkEnum, checkInt, checkKeys, checkNumber, checkObject, checkString } from '../../validate.ts';
-import type { Engine, EngineStatus, VoiceInfo } from '../types.ts';
+import { SentenceTooLongError, type Engine, type EngineStatus, type VoiceInfo } from '../types.ts';
 
 export const ENGINE_ID = 'zen-tts';
-export const ZEN_TTS_VERSION = '1.3.0';
+
+/** node_modules/zen-tts/package.json の version（読めなければ 'unknown'）。zen-tts 本体は読み込まない */
+const readZenTtsVersion = (): string => {
+  try {
+    const path = createRequire(import.meta.url).resolve('zen-tts/package.json');
+    const v = (JSON.parse(readFileSync(path, 'utf8')) as { version?: unknown }).version;
+    return typeof v === 'string' && v ? v : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+};
+export const ZEN_TTS_VERSION = readZenTtsVersion();
 export const SAMPLE_RATE = 44100;
 export const CREDIT = {
   ja: '音声合成：ZEN-TTS（https://zenryokukikai.com）',
@@ -158,14 +173,18 @@ const LOAD_TIMEOUT_MS = 120_000;
 
 type Child = {
   proc: ChildProcess;
+  /** 待ち行列のスロット */
+  slot: number;
   voiceId: string;
   state: 'starting' | 'idle' | 'busy';
   kernel: string | null;
   /** 合成中の文 */
   job: { id: number; resolve: (pcm: Float32Array) => void; reject: (e: Error) => void } | null;
+  /** stop() で意図的に終了した（exit / error で他の待ちを失敗させない） */
+  stopping: boolean;
 };
 
-type Waiter = { voice: ModelRecord; resolve: (c: Child) => void; reject: (e: Error) => void };
+type Waiter = { voice: ModelRecord; slot: number; resolve: (c: Child) => void; reject: (e: Error) => void };
 
 const unavailable = (msg: string): ApiError => new ApiError(503, 'engine_unavailable', msg);
 const timeout = (msg: string): ApiError => new ApiError(504, 'timeout', msg);
@@ -204,9 +223,9 @@ export class ZenTtsEngine implements Engine {
   private readonly childPath: string;
   private readonly sentenceTimeoutMs: number;
   private children: Child[] = [];
-  private currentVoice: string | null = null;
   private readonly waiters: Waiter[] = [];
-  private idleTimer: NodeJS.Timeout | null = null;
+  /** スロット → アイドル解放のタイマー */
+  private readonly idleTimers = new Map<number, NodeJS.Timeout>();
   private nextId = 0;
   private closed = false;
 
@@ -249,52 +268,69 @@ export class ZenTtsEngine implements Engine {
     }
   }
 
-  async synthesize(sentence: string, voice: ModelRecord, opts: ZenTtsOptions, signal: AbortSignal): Promise<Float32Array> {
+  async synthesize(sentence: string, voice: ModelRecord, opts: ZenTtsOptions, signal: AbortSignal, slot = 0): Promise<Float32Array> {
     const abortReason = (): Error =>
       signal.reason instanceof ApiError ? signal.reason : timeout('synthesis was aborted');
     if (signal.aborted) throw abortReason();
-    const child = await this.acquire(voice, signal, abortReason);
+    const s = Math.min(Math.max(0, slot), this.poolSize - 1);
+    let child: Child | undefined;
+    // 待ち・読み込み中の中断や失敗でも、そのスロットのアイドル解放を張り直す
     try {
+      child = await this.acquire(voice, s, signal, abortReason);
       return await this.speakOn(child, sentence, opts, signal, abortReason);
     } finally {
-      if (child.state === 'busy') child.state = 'idle';
+      if (child?.state === 'busy') child.state = 'idle';
       this.schedule();
-      this.armIdle();
+      this.armIdle(s);
     }
   }
 
   status(): EngineStatus {
+    // loaded・kernel・process は互換のため 1 プロセス分（読み込み済みの最初の子）
     const live = this.children.find(c => c.state !== 'starting') ?? this.children[0];
     return {
       id: this.id,
       loaded: live && live.state !== 'starting' ? live.voiceId : null,
       kernel: live?.kernel ?? null,
       process: live?.proc.pid ? { pid: live.proc.pid, rssBytes: rssOf(live.proc.pid) } : null,
+      processes: this.children
+        .filter(c => c.proc.pid)
+        .sort((a, b) => a.slot - b.slot)
+        .map(c => ({ slot: c.slot, voice: c.voiceId, pid: c.proc.pid!, state: c.state, rssBytes: rssOf(c.proc.pid!) })),
       idleUnloadSec: this.settings().idleUnloadSec,
     };
   }
 
   /** 設定の idleUnloadSec が変わったとき */
   settingsChanged(): void {
-    this.armIdle();
+    for (const c of this.children) this.armIdle(c.slot);
   }
 
   async close(): Promise<void> {
     this.closed = true;
-    if (this.idleTimer) clearTimeout(this.idleTimer);
+    for (const t of this.idleTimers.values()) clearTimeout(t);
+    this.idleTimers.clear();
     for (const w of this.waiters.splice(0)) w.reject(unavailable('engine is closed'));
     this.killAll();
   }
 
   // ---- 内部 ----
 
+  /** fork する。同期の失敗は 503。error イベントを常に受けるハンドラを付ける（個々の失敗の扱いは waitReady・spawn） */
   private forkChild(): ChildProcess {
-    return fork(this.childPath, [], {
-      serialization: 'advanced',
-      // 親の --test などを引き継がない
-      execArgv: [],
-      stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
-    });
+    let proc: ChildProcess;
+    try {
+      proc = fork(this.childPath, [], {
+        serialization: 'advanced',
+        // 親の --test などを引き継がない
+        execArgv: [],
+        stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+      });
+    } catch (e) {
+      throw unavailable(`failed to start synthesis process: ${(e as Error).message}`);
+    }
+    proc.on('error', e => console.error(`synthesis process error: ${e.message}`));
+    return proc;
   }
 
   /** load を送り、ready を待つ */
@@ -334,12 +370,9 @@ export class ZenTtsEngine implements Engine {
     });
   }
 
-  private acquire(voice: ModelRecord, signal: AbortSignal, abortReason: () => Error): Promise<Child> {
+  private acquire(voice: ModelRecord, slot: number, signal: AbortSignal, abortReason: () => Error): Promise<Child> {
     if (this.closed) return Promise.reject(unavailable('engine is closed'));
-    if (this.idleTimer) {
-      clearTimeout(this.idleTimer);
-      this.idleTimer = null;
-    }
+    this.clearIdle(slot);
     return new Promise((resolve, reject) => {
       const onAbort = (): void => {
         const i = this.waiters.indexOf(waiter);
@@ -349,6 +382,7 @@ export class ZenTtsEngine implements Engine {
       };
       const waiter: Waiter = {
         voice,
+        slot,
         resolve: c => {
           signal.removeEventListener('abort', onAbort);
           resolve(c);
@@ -364,31 +398,48 @@ export class ZenTtsEngine implements Engine {
     });
   }
 
-  /** 待ちの先頭から、空いた子を割り当てる。声が違えば、合成中の文が終わってから子を入れ替える */
+  /** 待ちの古い順に、そのスロットの子を割り当てる。声が違えば、合成中の文が終わってからその子を入れ替える */
   private schedule(): void {
-    while (this.waiters.length > 0) {
-      const w = this.waiters[0]!;
-      if (this.currentVoice !== w.voice.id) {
-        if (this.children.some(c => c.state === 'busy')) return;
-        this.killAll();
-        this.currentVoice = w.voice.id;
+    // スロットごとに最も古い待ちだけを見る（スロット内は FIFO）
+    const seen = new Set<number>();
+    for (const w of [...this.waiters]) {
+      if (seen.has(w.slot)) continue;
+      seen.add(w.slot);
+      let child = this.children.find(c => c.slot === w.slot);
+      if (child && child.voiceId !== w.voice.id) {
+        if (child.state === 'busy') continue;
+        this.stop(child);
+        child = undefined;
       }
-      const idle = this.children.find(c => c.state === 'idle');
-      if (idle) {
-        this.waiters.shift();
-        idle.state = 'busy';
-        w.resolve(idle);
+      if (child) {
+        if (child.state !== 'idle') continue;
+        this.waiters.splice(this.waiters.indexOf(w), 1);
+        child.state = 'busy';
+        w.resolve(child);
         continue;
       }
       // 起動中の子があればその ready を待つ（同時に起動するのは 1 つずつ）
-      if (this.children.length < this.poolSize && !this.children.some(c => c.state === 'starting')) this.spawn(w.voice);
-      return;
+      if (!this.children.some(c => c.state === 'starting')) this.spawn(w.voice, w.slot);
     }
   }
 
-  private spawn(voice: ModelRecord): void {
-    const proc = this.forkChild();
-    const child: Child = { proc, voiceId: voice.id, state: 'starting', kernel: null, job: null };
+  /** この子を待っている要求（同じスロット・同じ声）を失敗させる。他のスロットの待ちには触れない */
+  private rejectWaiters(slot: number, voiceId: string, e: Error): void {
+    for (const w of this.waiters.filter(x => x.slot === slot && x.voice.id === voiceId)) {
+      this.waiters.splice(this.waiters.indexOf(w), 1);
+      w.reject(e);
+    }
+  }
+
+  private spawn(voice: ModelRecord, slot: number): void {
+    let proc: ChildProcess;
+    try {
+      proc = this.forkChild();
+    } catch (e) {
+      this.rejectWaiters(slot, voice.id, e as Error);
+      return;
+    }
+    const child: Child = { proc, slot, voiceId: voice.id, state: 'starting', kernel: null, job: null, stopping: false };
     this.children.push(child);
     const modelPath = this.registry.modelPath(this.id, voice.id, this.modelExt);
     this.waitReady(proc, modelPath).then(
@@ -396,29 +447,34 @@ export class ZenTtsEngine implements Engine {
         if (!this.children.includes(child)) return;
         child.kernel = ready.kernel;
         child.state = 'idle';
-        proc.on('message', (m: { type: string; id?: number; pcm?: Float32Array; message?: string }) => {
+        proc.on('message', (m: { type: string; id?: number; pcm?: Float32Array; message?: string; kind?: string }) => {
           const job = child.job;
           if (!job || job.id !== m.id) return;
           child.job = null;
           if (m.type === 'result') job.resolve(m.pcm!);
+          else if (m.kind === 'sentence_too_long') job.reject(new SentenceTooLongError(m.message ?? 'sentence is too long'));
           else job.reject(unavailable(`synthesis failed: ${m.message}`));
         });
-        proc.on('exit', (code, sig) => {
+        const onGone = (e: Error): void => {
+          // stop() で止めた子・もう管理していない子は、待ちに触れない
+          if (child.stopping || !this.children.includes(child)) return;
           this.drop(child);
-          child.job?.reject(unavailable(`synthesis process exited (${sig ?? `code ${code}`})`));
+          child.job?.reject(e);
           child.job = null;
           this.schedule();
-        });
+        };
+        proc.on('exit', (code, sig) => onGone(unavailable(`synthesis process exited (${sig ?? `code ${code}`})`)));
+        proc.on('error', e => onGone(unavailable(`synthesis process failed: ${e.message}`)));
         this.schedule();
+        // 待っていた要求が中断済みなら誰も使わないので、アイドル解放を張る
+        this.armIdle(slot);
       },
       (e: Error) => {
         proc.kill('SIGKILL');
+        if (child.stopping || !this.children.includes(child)) return;
         this.drop(child);
-        // この声を待っている要求は同じ理由で失敗する
-        for (const w of this.waiters.filter(x => x.voice.id === voice.id)) {
-          this.waiters.splice(this.waiters.indexOf(w), 1);
-          w.reject(e);
-        }
+        // この子を待っている要求は同じ理由で失敗する
+        this.rejectWaiters(slot, voice.id, e);
         this.schedule();
       },
     );
@@ -466,31 +522,42 @@ export class ZenTtsEngine implements Engine {
   private drop(child: Child): void {
     const i = this.children.indexOf(child);
     if (i >= 0) this.children.splice(i, 1);
-    if (this.children.length === 0 && this.waiters.length === 0) this.currentVoice = null;
+  }
+
+  /** 子を 1 つ終了する（合成中の文は 503） */
+  private stop(child: Child): void {
+    child.stopping = true;
+    this.drop(child);
+    child.job?.reject(unavailable('synthesis process was stopped'));
+    child.job = null;
+    child.proc.kill('SIGKILL');
   }
 
   private killAll(): void {
-    for (const c of this.children.splice(0)) {
-      c.job?.reject(unavailable('synthesis process was stopped'));
-      c.job = null;
-      c.proc.kill('SIGKILL');
-    }
-    this.currentVoice = null;
+    for (const c of [...this.children]) this.stop(c);
   }
 
-  /** すべての子が空いていて待ちが無ければ、idleUnloadSec 後に子を終了する */
-  private armIdle(): void {
-    if (this.idleTimer) {
-      clearTimeout(this.idleTimer);
-      this.idleTimer = null;
-    }
+  private clearIdle(slot: number): void {
+    const t = this.idleTimers.get(slot);
+    if (t) clearTimeout(t);
+    this.idleTimers.delete(slot);
+  }
+
+  /** そのスロットの子が空いていてそのスロットの待ちが無ければ、idleUnloadSec 後にその子を終了する */
+  private armIdle(slot: number): void {
+    this.clearIdle(slot);
     const sec = this.settings().idleUnloadSec;
-    if (sec <= 0 || this.closed || this.children.length === 0) return;
-    if (this.waiters.length > 0 || this.children.some(c => c.state !== 'idle')) return;
-    this.idleTimer = setTimeout(() => {
-      this.idleTimer = null;
-      if (this.waiters.length === 0 && this.children.every(c => c.state === 'idle')) this.killAll();
+    const idle = (): Child | undefined => {
+      const c = this.children.find(x => x.slot === slot);
+      return c && c.state === 'idle' && !this.waiters.some(w => w.slot === slot) ? c : undefined;
+    };
+    if (sec <= 0 || this.closed || !idle()) return;
+    const timer = setTimeout(() => {
+      this.idleTimers.delete(slot);
+      const c = idle();
+      if (c) this.stop(c);
     }, sec * 1000);
-    this.idleTimer.unref();
+    timer.unref();
+    this.idleTimers.set(slot, timer);
   }
 }

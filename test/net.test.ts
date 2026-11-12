@@ -60,12 +60,16 @@ test('config: 0.0.0.0・:: は起動時エラー、CIDR の誤りもエラー', 
   assert.throws(() => loadConfig({ TTS_HOSTS: '::' }), /::/);
   assert.throws(() => loadConfig({ TTS_ALLOW_CIDRS: '192.0.2.0/99' }), /CIDR/);
   assert.throws(() => loadConfig({ TTS_CONCURRENCY: '3' }), /TTS_CONCURRENCY/);
+  assert.throws(() => loadConfig({ TTS_AFFINITY_MAX_WAIT_MS: '60001' }), /TTS_AFFINITY_MAX_WAIT_MS/);
+  assert.throws(() => loadConfig({ TTS_AFFINITY_MAX_WAIT_MS: '1.5' }), /TTS_AFFINITY_MAX_WAIT_MS/);
+  assert.equal(loadConfig({ TTS_AFFINITY_MAX_WAIT_MS: '0' }).affinityMaxWaitMs, 0);
   const c = loadConfig({ HOME: '/nonexistent-home', TTS_HOSTS: '127.0.0.1, 192.0.2.10', TTS_TOKEN: 'x'.repeat(32) });
   assert.deepEqual(c.hosts, ['127.0.0.1', '192.0.2.10']);
   assert.equal(c.port, 8710);
   assert.equal(c.dataDir, '/nonexistent-home/.local/share/tts-gateway');
   assert.equal(c.cacheDir, '/nonexistent-home/.cache/tts-gateway/audio');
   assert.equal(c.modelMaxBytes, 512 * 1024 * 1024);
+  assert.equal(c.affinityMaxWaitMs, 5000);
 });
 
 /** loadConfig の警告を集める */

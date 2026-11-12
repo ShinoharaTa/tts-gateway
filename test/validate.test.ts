@@ -83,12 +83,21 @@ test('範囲外・型違い', () => {
   rejects({ text: 'a', zenTts: { accentSettings: { accentHeight: 4.5, pitchRange: [1, 2] } } }, 400, 'invalid_request', 'zenTts.accentSettings.pitchRange');
 });
 
-test('bitrate: 圧縮形式だけ、16k〜320k', () => {
-  assert.equal(validateSynthRequest({ text: 'a', format: 'mp3', bitrate: '192k' }, ctx).bitrate, '192k');
+test('bitrate: 圧縮形式だけ、形式ごとの範囲（opus 6k〜256k、mp3・m4a 8k〜320k）', () => {
+  const bitrate = (format: string, b: string): string | undefined => validateSynthRequest({ text: 'a', format, bitrate: b }, ctx).bitrate;
+  assert.equal(bitrate('mp3', '192k'), '192k');
+  for (const [format, min, max] of [['opus', 6, 256], ['mp3', 8, 320], ['m4a', 8, 320]] as const) {
+    assert.equal(bitrate(format, `${min}k`), `${min}k`);
+    assert.equal(bitrate(format, `${max}k`), `${max}k`);
+    rejects({ text: 'a', format, bitrate: `${min - 1}k` }, 400, 'invalid_request', 'bitrate');
+    rejects({ text: 'a', format, bitrate: `${max + 1}k` }, 400, 'invalid_request', 'bitrate');
+  }
+  // opus の 257k〜320k は ffmpeg が失敗するので 400
+  rejects({ text: 'a', format: 'opus', bitrate: '320k' }, 400, 'invalid_request', 'bitrate');
+  rejects({ text: 'a', format: 'mp3', bitrate: '0k' }, 400, 'invalid_request', 'bitrate');
+  rejects({ text: 'a', format: 'mp3', bitrate: '064k' }, 400, 'invalid_request', 'bitrate');
   rejects({ text: 'a', bitrate: '128k' }, 400, 'invalid_request', 'bitrate');
   rejects({ text: 'a', format: 'flac', bitrate: '128k' }, 400, 'invalid_request', 'bitrate');
-  rejects({ text: 'a', format: 'mp3', bitrate: '8k' }, 400, 'invalid_request', 'bitrate');
-  rejects({ text: 'a', format: 'mp3', bitrate: '321k' }, 400, 'invalid_request', 'bitrate');
   rejects({ text: 'a', format: 'mp3', bitrate: 128 }, 400, 'invalid_request', 'bitrate');
 });
 
