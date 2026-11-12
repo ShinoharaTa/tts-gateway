@@ -182,13 +182,23 @@ curl -sS -X POST http://127.0.0.1:8710/v1/synthesize \
 {
   "version": "0.1.0",
   "uptimeSec": 120,
-  "engines": [{ "id": "zen-tts", "loaded": "marine", "kernel": "wasm", "process": { "pid": 1234, "rssBytes": 300000000 }, "idleUnloadSec": 600 }],
-  "queue": { "running": 1, "waiting": 0, "max": 8, "concurrency": 1 },
+  "engines": [{
+    "id": "zen-tts", "loaded": "marine", "kernel": "wasm", "process": { "pid": 1234, "rssBytes": 300000000 },
+    "processes": [
+      { "slot": 0, "voice": "marine", "pid": 1234, "state": "idle", "rssBytes": 300000000 },
+      { "slot": 1, "voice": "kai", "pid": 1240, "state": "busy", "rssBytes": 310000000 }
+    ],
+    "idleUnloadSec": 600
+  }],
+  "queue": { "running": 1, "waiting": 0, "max": 8, "concurrency": 2 },
   "cache": { "entries": 12, "bytes": 1048576, "maxBytes": 524288000 },
   "ffmpeg": { "available": true, "path": "ffmpeg", "version": "7.0.2", "reason": null },
   "memory": { "rssBytes": 80000000 }
 }
 ```
+
+`loaded`・`kernel`・`process` は合成プロセス 1 つ分（互換のため残している）。`processes` はスロット（`TTS_CONCURRENCY` 個）ごとの合成プロセスで、
+`state` は `starting`（声の読み込み中）・`idle`・`busy`（合成中）。`rssBytes` は取れなければ `null`。プロセスの無いスロットは載らない。
 
 `ffmpeg` は `FFMPEG -version` を試した結果（`path` は `FFMPEG` の値、`version` は出力の 1 行目から取った版、取れなければ `null`、`reason` は使えない理由、使えれば `null`）。
 起動時に 1 回試し、その後は状態取得・ffmpeg の要る要求のときに前回から 30 秒以上たっていれば試し直す（起動後に入れても 30 秒以内に反映される）。
@@ -292,7 +302,16 @@ curl -sS -X POST http://127.0.0.1:8710/v1/synthesize \
 
 ## 同時実行
 
-- 合成は `TTS_CONCURRENCY`（既定 1、最大 2）本ずつ。待ち行列は FIFO で `TTS_QUEUE_MAX`（既定 8）件まで、超えたら 429。
+- 合成は `TTS_CONCURRENCY`（既定 1、最大 2）本ずつ。待ち行列は `TTS_QUEUE_MAX`（既定 8）件まで、超えたら 429。
 - 同じキャッシュキーの要求が合成中なら、新たに合成せずその結果を待つ。
-- モデルは最初の要求で読み込み（数秒）、`idleUnloadSec` 使われなければ合成プロセスごと終了してメモリを返す。
-- 同時に読み込む声はエンジンごとに 1 つ。別の声の要求は、今の合成が終わってから読み直す。
+- モデルは最初の要求で読み込み（数秒）、`idleUnloadSec` 使われなければ合成プロセスごと終了してメモリを返す（スロットごとに数える）。
+- 合成プロセスは同時実行の枠（スロット）ごとに 1 つで、それぞれ 1 つの声を読む。別の声の要求がそのスロットに来たら、そのプロセスだけ読み直す。
+- `TTS_CONCURRENCY=1` の待ち行列は FIFO。`2` では、空いたスロットが次の順で 1 件取る（声の読み直しを減らす）:
+  1. 待ち行列の先頭（最も古い）の要求が、待ち行列に入ってから 15 秒以上たっていれば、それ（声が違えば読み直す）
+  2. 最初に追い越されてから `TTS_AFFINITY_MAX_WAIT_MS`（既定 5000）ミリ秒以上たった要求のうち最も古いもの（声が違えば読み直す）
+  3. このスロットの声と同じ声の要求のうち最も古いもの
+  4. 他のスロットが読み込んでいない声の要求のうち最も古いもの
+  5. 先頭の要求
+
+  そのため `2` では、要求が届いた順に始まるとは限らない（追い越され始めてから最長でおよそ `TTS_AFFINITY_MAX_WAIT_MS`、
+  待ち行列に入ってから最長でおよそ 15 秒と、そのとき合成中の要求が終わるまで）。

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ApiError } from '../src/errors.ts';
-import { RETRY_AFTER_SEC, SynthQueue } from '../src/queue.ts';
+import { AFFINITY_MAX_WAIT_MS, RETRY_AFTER_SEC, SynthQueue } from '../src/queue.ts';
 
 const deferred = <T>() => {
   let resolve!: (v: T) => void;
@@ -79,10 +79,190 @@ test('失敗は合流した全員に返り、キューは止まらない', async
   assert.equal(await q.run('x', async () => 'ok').promise, 'ok');
 });
 
+const flush = () => new Promise<void>(r => setImmediate(r));
+
+test('2 スロット: 空いたスロットは同じ声 → 他のスロットに無い声 → 先頭の順で取る', async () => {
+  const q = new SynthQueue({ concurrency: 2, max: 8, now: () => 0 });
+  const started: string[] = [];
+  const gates = new Map<string, ReturnType<typeof deferred<void>>>();
+  const add = (name: string, voice: string) => {
+    const g = deferred<void>();
+    gates.set(name, g);
+    return q.run(undefined, async slot => {
+      started.push(`${name}@${slot}`);
+      await g.promise;
+    }, voice).promise;
+  };
+  const runs = [add('a1', 'A'), add('b1', 'B'), add('a2', 'A'), add('c1', 'C'), add('b2', 'B'), add('a3', 'A')];
+  await flush();
+  assert.deepEqual(started, ['a1@0', 'b1@1']);
+  // スロット 0（A）が空く → 待ちの先頭 a2（A）
+  gates.get('a1')!.resolve();
+  await flush();
+  assert.deepEqual(started.slice(2), ['a2@0']);
+  // スロット 1（B）が空く → 先頭 c1 を追い越して b2（B）
+  gates.get('b1')!.resolve();
+  await flush();
+  assert.deepEqual(started.slice(3), ['b2@1']);
+  // スロット 0（A）が空く → a3（A）
+  gates.get('a2')!.resolve();
+  await flush();
+  assert.deepEqual(started.slice(4), ['a3@0']);
+  // スロット 1（B）が空く → B は無く、C はどこにも無いので c1
+  gates.get('b2')!.resolve();
+  await flush();
+  assert.deepEqual(started.slice(5), ['c1@1']);
+  for (const g of gates.values()) g.resolve();
+  await Promise.all(runs);
+});
+
+test('2 スロット: 他のスロットが読み込んでいる声は後回しにし、空きが複数ならその声のスロットへ', async () => {
+  const q = new SynthQueue({ concurrency: 2, max: 8, now: () => 0 });
+  const started: string[] = [];
+  const gates: ReturnType<typeof deferred<void>>[] = [];
+  const add = (name: string, voice: string) => {
+    const g = deferred<void>();
+    gates.push(g);
+    return q.run(undefined, async slot => {
+      started.push(`${name}@${slot}`);
+      await g.promise;
+    }, voice).promise;
+  };
+  const first = [add('a1', 'A'), add('b1', 'B')];
+  await flush();
+  // スロット 1（B）は合成中。スロット 0（A）が空くと、先頭の b2 ではなく c1
+  const rest = [add('b2', 'B'), add('c1', 'C')];
+  gates[0]!.resolve();
+  await flush();
+  assert.deepEqual(started, ['a1@0', 'b1@1', 'c1@0']);
+  for (const g of gates) g.resolve();
+  await Promise.all([...first, ...rest]);
+  // 両方空いているとき、B の要求はスロット 1（B）へ
+  started.length = 0;
+  const b3 = add('b3', 'B');
+  gates.at(-1)!.resolve();
+  await b3;
+  assert.deepEqual(started, ['b3@1']);
+});
+
+/** スロット 1 を B で塞いだまま、待ちに C（最も古い）と A を 3 つ置く。スロット 0 は A を流す */
+const crowded = async (q: SynthQueue) => {
+  const started: string[] = [];
+  const add = (name: string, voice: string, gate: Promise<void>) =>
+    q.run(undefined, async slot => {
+      started.push(`${name}@${slot}`);
+      await gate;
+    }, voice).promise;
+  const hold = deferred<void>();
+  const slot0 = [deferred<void>()];
+  const runs = [add('a0', 'A', slot0[0]!.promise), add('b0', 'B', hold.promise)];
+  await flush();
+  runs.push(add('c', 'C', Promise.resolve()));
+  for (let i = 1; i <= 3; i++) {
+    const g = deferred<void>();
+    slot0.push(g);
+    runs.push(add(`a${i}`, 'A', g.promise));
+  }
+  const done = async () => {
+    hold.resolve();
+    for (const g of slot0) g.resolve();
+    await Promise.all(runs);
+  };
+  return { started, slot0, done };
+};
+
+test(`2 スロット: 最初に追い越されてから ${AFFINITY_MAX_WAIT_MS}ms 以上たった要求は声が違っても流す`, async () => {
+  let now = 0;
+  const q = new SynthQueue({ concurrency: 2, max: 8, now: () => now });
+  const { started, slot0, done } = await crowded(q);
+  // 1 秒: A が C を追い越す（C の起点は 1 秒）
+  now = 1000;
+  slot0[0]!.resolve();
+  await flush();
+  assert.deepEqual(started.slice(2), ['a1@0']);
+  // 起点から 4.9 秒: まだ追い越す（待ち行列に入ってからなら 5 秒を過ぎている）
+  now = 5900;
+  slot0[1]!.resolve();
+  await flush();
+  assert.deepEqual(started.slice(3), ['a2@0']);
+  // 起点から 5 秒: 声が違っても C
+  now = 6000;
+  slot0[2]!.resolve();
+  await flush();
+  assert.deepEqual(started.slice(4, 5), ['c@0']);
+  await flush();
+  assert.deepEqual(started.slice(5), ['a3@0']);
+  await done();
+});
+
+test('2 スロット: 上限は注入でき、待ち行列に入って 15 秒たった要求は追い越しにかかわらず最優先', async () => {
+  let now = 0;
+  const q = new SynthQueue({ concurrency: 2, max: 8, now: () => now, affinityMaxWaitMs: 60_000 });
+  const { started, slot0, done } = await crowded(q);
+  // 12 秒: 初めて追い越される（起点 12 秒、上限 60 秒）
+  now = 12_000;
+  slot0[0]!.resolve();
+  await flush();
+  assert.deepEqual(started.slice(2), ['a1@0']);
+  // 14.9 秒: まだ追い越す
+  now = 14_900;
+  slot0[1]!.resolve();
+  await flush();
+  assert.deepEqual(started.slice(3), ['a2@0']);
+  // 15 秒: 起点からは 3 秒だが、待ち行列に入ってから 15 秒なので C
+  now = 15_000;
+  slot0[2]!.resolve();
+  await flush();
+  assert.deepEqual(started.slice(4, 5), ['c@0']);
+  await done();
+});
+
+test('1 スロットは声に関係なく FIFO', async () => {
+  const q = new SynthQueue({ concurrency: 1, max: 8, now: () => 0 });
+  const started: string[] = [];
+  const gate = deferred<void>();
+  const runs = ['A', 'B', 'A', 'B'].map((v, i) =>
+    q.run(undefined, async slot => {
+      started.push(`${v}${i}@${slot}`);
+      await gate.promise;
+    }, v).promise,
+  );
+  gate.resolve();
+  await Promise.all(runs);
+  assert.deepEqual(started, ['A0@0', 'B1@0', 'A2@0', 'B3@0']);
+});
+
+test('2 スロット: 声を持っていない空きスロットを優先し、A と B の交互で声を入れ替えない', async () => {
+  let now = 0;
+  const q = new SynthQueue({ concurrency: 2, max: 8, now: () => now });
+  const started: string[] = [];
+  const one = (name: string, voice: string) =>
+    q.run(undefined, async slot => {
+      started.push(`${name}@${slot}`);
+    }, voice).promise;
+  // A を 1 件 → 終わってから B を 1 件。B はスロット 0（A）を追い出さず、未読み込みのスロット 1 へ
+  await one('a1', 'A');
+  now = 100;
+  await one('b1', 'B');
+  assert.deepEqual(started, ['a1@0', 'b1@1']);
+  // 以後、A と B の交互でも各声は同じスロットに載る
+  for (let i = 2; i <= 4; i++) {
+    now += 100;
+    await one(`a${i}`, 'A');
+    now += 100;
+    await one(`b${i}`, 'B');
+  }
+  assert.deepEqual(started.slice(2), ['a2@0', 'b2@1', 'a3@0', 'b3@1', 'a4@0', 'b4@1']);
+  // どちらも声を持っていない C は、最後に割り当てた時刻が古いスロット 0（A）へ
+  now += 100;
+  await one('c1', 'C');
+  assert.deepEqual(started.slice(-1), ['c1@0']);
+});
+
 /** signal が abort されたら reason で失敗し、gate が開いたら成功する fn。最後に渡された signal を stop() で返す */
 const abortable = (gate: Promise<string>) => {
   let last: AbortSignal | undefined;
-  const fn = (s: AbortSignal): Promise<string> => {
+  const fn = (_slot: number, s: AbortSignal): Promise<string> => {
     last = s;
     return new Promise((resolve, reject) => {
       void gate.then(resolve);
@@ -95,11 +275,11 @@ const abortable = (gate: Promise<string>) => {
 test('待ち行列での待ちが期限を超えたら 503（Retry-After 付き）で失敗し、行列から取り除く', async () => {
   const q = new SynthQueue({ concurrency: 1, max: 1 });
   const gate = deferred<void>();
-  const first = q.run(undefined, () => gate.promise, { waitTimeoutMs: 50 });
+  const first = q.run(undefined, () => gate.promise, undefined, { waitTimeoutMs: 50 });
   let ran = false;
   const second = q.run('k', async () => {
     ran = true;
-  }, { waitTimeoutMs: 50 });
+  }, undefined, { waitTimeoutMs: 50 });
   // 合流した要求にも同じ失敗が返る
   const joined = q.run('k', async () => {});
   assert.equal(joined.joined, true);
@@ -128,7 +308,7 @@ test('待ち中に abort された要求は行列から取り除き、実行し�
   let ran = false;
   const second = q.run('k', async () => {
     ran = true;
-  }, { signal: ac.signal });
+  }, undefined, { signal: ac.signal });
   assert.equal(q.stats().waiting, 1);
   const reason = new Error('gone');
   ac.abort(reason);
@@ -145,8 +325,8 @@ test('実行中の abort: 合流した要求が残っていれば止めず、全
   const gate = deferred<string>();
   const one = abortable(gate.promise);
   const acs = [new AbortController(), new AbortController()];
-  const a = q.run('k', one.fn, { signal: acs[0]!.signal });
-  const b = q.run('k', one.fn, { signal: acs[1]!.signal });
+  const a = q.run('k', one.fn, undefined, { signal: acs[0]!.signal });
+  const b = q.run('k', one.fn, undefined, { signal: acs[1]!.signal });
   assert.equal(b.joined, true);
   acs[0]!.abort(new Error('a gone'));
   await assert.rejects(a.promise, /a gone/);
@@ -157,8 +337,8 @@ test('実行中の abort: 合流した要求が残っていれば止めず、全
   // 今度は全員が abort する
   const two = abortable(deferred<string>().promise);
   const acs2 = [new AbortController(), new AbortController()];
-  const c = q.run('k2', two.fn, { signal: acs2[0]!.signal });
-  const d = q.run('k2', two.fn, { signal: acs2[1]!.signal });
+  const c = q.run('k2', two.fn, undefined, { signal: acs2[0]!.signal });
+  const d = q.run('k2', two.fn, undefined, { signal: acs2[1]!.signal });
   acs2[0]!.abort(new Error('c gone'));
   assert.equal(two.stop().aborted, false);
   acs2[1]!.abort(new Error('d gone'));
@@ -177,11 +357,98 @@ test('signal を渡さない要求が合流していれば、ほかが abort し
   const gate = deferred<string>();
   const one = abortable(gate.promise);
   const ac = new AbortController();
-  const a = q.run('k', one.fn, { signal: ac.signal });
+  const a = q.run('k', one.fn, undefined, { signal: ac.signal });
   const b = q.run('k', async () => 'unused');
   ac.abort(new Error('gone'));
   await assert.rejects(a.promise, /gone/);
   assert.equal(one.stop().aborted, false);
   gate.resolve('done');
   assert.equal(await b.promise, 'done');
+});
+
+test('2 スロット: 声の親和性で待たされている要求が abort されると行列から外れ、他の要求の追い越しの記録は残る', async () => {
+  let now = 0;
+  const q = new SynthQueue({ concurrency: 2, max: 8, now: () => now });
+  const started: string[] = [];
+  const add = (name: string, voice: string, gate: Promise<void>, signal?: AbortSignal) =>
+    q.run(undefined, async slot => {
+      started.push(`${name}@${slot}`);
+      await gate;
+    }, voice, { signal }).promise;
+  const hold = deferred<void>();
+  const slot0 = [deferred<void>(), deferred<void>(), deferred<void>()];
+  const runs = [add('a0', 'A', slot0[0]!.promise), add('b0', 'B', hold.promise)];
+  await flush();
+  const ac = new AbortController();
+  const c = add('c', 'C', Promise.resolve(), ac.signal);
+  runs.push(add('d', 'D', Promise.resolve()), add('a1', 'A', slot0[1]!.promise), add('a2', 'A', slot0[2]!.promise));
+  // 1 秒: a1 が c・d を追い越す（どちらも起点 1 秒）
+  now = 1000;
+  slot0[0]!.resolve();
+  await flush();
+  assert.deepEqual(started.slice(2), ['a1@0']);
+  // 待たされている c が abort される → 行列から外れ、実行しない
+  const reason = new Error('c gone');
+  ac.abort(reason);
+  await assert.rejects(c, (e: unknown) => e === reason);
+  assert.equal(q.stats().waiting, 2);
+  // 起点から 5 秒: d の追い越しの記録は残っていて、声が違っても d を流す。その後に a2
+  now = 6000;
+  slot0[1]!.resolve();
+  await flush();
+  assert.deepEqual(started.slice(3, 4), ['d@0']);
+  await flush();
+  assert.deepEqual(started.slice(4), ['a2@0']);
+  hold.resolve();
+  for (const g of slot0) g.resolve();
+  await Promise.all(runs);
+  assert.ok(!started.some(s => s.startsWith('c@')));
+  assert.deepEqual(q.stats(), { running: 0, waiting: 0, max: 8, concurrency: 2 });
+});
+
+test('2 スロット: 待ちの期限切れは 15 秒優先・追い越しの上限より先に効き、二重に解決しない', async () => {
+  let now = 0;
+  const q = new SynthQueue({ concurrency: 2, max: 8, now: () => now });
+  const started: string[] = [];
+  const add = (key: string | undefined, name: string, voice: string, gate: Promise<void>, o = {}) =>
+    q.run(key, async slot => {
+      started.push(`${name}@${slot}`);
+      await gate;
+      return name;
+    }, voice, o);
+  const hold = deferred<void>();
+  const slot0 = [deferred<void>(), deferred<void>()];
+  const runs = [add(undefined, 'a0', 'A', slot0[0]!.promise).promise, add(undefined, 'b0', 'B', hold.promise).promise];
+  await flush();
+  const c = add('k', 'c', 'C', Promise.resolve(), { waitTimeoutMs: 50 });
+  // 合流した要求にも同じ失敗が 1 回だけ返る
+  const joined = add('k', 'c2', 'C', Promise.resolve());
+  assert.equal(joined.joined, true);
+  runs.push(add(undefined, 'a1', 'A', slot0[1]!.promise).promise);
+  const settled: string[] = [];
+  for (const [name, p] of [['c', c.promise], ['joined', joined.promise]] as const) {
+    p.then(() => settled.push(`${name}:ok`), (e: unknown) => settled.push(`${name}:${(e as ApiError).status}`));
+  }
+  // c は追い越され（起点 1 秒）、その後 20 秒たつ: 15 秒優先・追い越しの上限のどちらでも次に流れる状態
+  now = 1000;
+  slot0[0]!.resolve();
+  await flush();
+  assert.deepEqual(started.slice(2), ['a1@0']);
+  now = 20_000;
+  // 空きが出る前に期限が切れる
+  await new Promise(r => setTimeout(r, 100));
+  assert.deepEqual(settled.sort(), ['c:503', 'joined:503']);
+  assert.equal(q.stats().waiting, 0);
+  // スロットが空いても c は流れず、失敗の後に成功が来ることもない
+  slot0[1]!.resolve();
+  hold.resolve();
+  await Promise.all(runs);
+  await flush();
+  assert.deepEqual(settled.sort(), ['c:503', 'joined:503']);
+  assert.ok(!started.some(s => s.startsWith('c')));
+  // 同じキーは新しく積む
+  const again = add('k', 'c3', 'C', Promise.resolve());
+  assert.equal(again.joined, false);
+  assert.equal(await again.promise, 'c3');
+  assert.deepEqual(q.stats(), { running: 0, waiting: 0, max: 8, concurrency: 2 });
 });

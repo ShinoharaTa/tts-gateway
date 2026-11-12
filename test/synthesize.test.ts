@@ -64,7 +64,7 @@ test('renderAudio: 無音詰め・文間の無音・先頭と末尾の無音・�
   assert.equal(r2.audio.readInt16LE(44 + 400 * 2), 0x7fff);
 });
 
-const setup = async (o: { timeoutSec?: number } = {}) => {
+const setup = async (o: { concurrency?: number; timeoutSec?: number } = {}) => {
   const { dir, cleanup } = await tempDir();
   const settings = await SettingsStore.load(join(dir, 'data'));
   const registry = await Registry.load(join(dir, 'data'), () => '.fake');
@@ -75,12 +75,12 @@ const setup = async (o: { timeoutSec?: number } = {}) => {
   const cache = new AudioCache({ dir: join(dir, 'cache'), maxBytes: () => settings.get().cacheMaxMB * 1024 * 1024, ttlMs: () => 1e12 });
   await cache.init();
   const dictionary = await Dictionary.load(join(PACKAGE_DIR, 'dict', 'readings.tsv'), join(dir, 'data', 'readings.tsv'));
-  const queue = new SynthQueue({ concurrency: 1, max: 8 });
+  const queue = new SynthQueue({ concurrency: o.concurrency ?? 1, max: 8 });
   const synth = new Synthesizer({
     engines: new Map([[engine.id, engine]]), registry, settings, cache, queue,
     dictionary, maxChars: 2000, timeoutSec: o.timeoutSec ?? 60, ffmpeg: 'false',
   });
-  return { synth, engine, settings, cache, queue, cleanup };
+  return { synth, engine, settings, registry, cache, queue, cleanup };
 };
 
 test('Synthesizer: 辞書を通した文を合成し、2 回目はキャッシュ、cache:false は bypass', async () => {
@@ -161,6 +161,32 @@ test('Synthesizer.normalize: 読み・文・当たった語・未知語', async 
     assert.equal(m.spoken, 'Foo は 50パーセント です');
     assert.deepEqual(m.unknownWords, [{ word: 'Foo', count: 1 }]);
     assert.throws(() => synth.normalize({ text: 'a', format: 'wav', bitrate: '64k' }), /bitrate/);
+  } finally {
+    await cleanup();
+  }
+});
+
+test('Synthesizer: 2 スロットで声 A/B が交互に来ても、スロットごとに同じ声を流して読み直さない', async () => {
+  const { synth, engine, registry, cleanup } = await setup({ concurrency: 2 });
+  try {
+    await registry.add(installedModel('zen-tts', 'kai'));
+    engine.delayMs = 20;
+    // A は 2 文・B は 1 文（B が先に終わる）。FIFO なら空いたスロットに次の A が入って読み直しが起きる
+    const reqs = [0, 1, 2, 3, 4, 5, 6, 7].map(i =>
+      i % 2 === 0
+        ? synth.synthesize({ text: `いち${i}。に${i}。`, voice: 'marine', cache: false })
+        : synth.synthesize({ text: `さん${i}。`, voice: 'kai', cache: false }),
+    );
+    await Promise.all(reqs);
+    assert.equal(engine.calls.length, 4 * 2 + 4);
+    // スロットごとの声の並び（同じ声が続けば 1 つにまとめる）
+    const runs = (slot: number) =>
+      engine.calls.filter(c => c.slot === slot).map(c => c.voice).filter((v, i, a) => v !== a[i - 1]);
+    // 両方の声が待っている間はスロットが声を保つ。B が尽きた後は空いたスロット 1 が残りの A を取る（規則 4）
+    assert.deepEqual(runs(0), ['marine']);
+    assert.deepEqual(runs(1), ['kai', 'marine']);
+    // FIFO なら B が先に空けたスロットへ次の A、A が空けたスロットへ次の B が入り、ほぼ毎回読み直す
+    assert.equal(engine.loads, 3);
   } finally {
     await cleanup();
   }

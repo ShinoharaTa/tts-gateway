@@ -136,12 +136,14 @@ export const renderAudio = async (o: {
   options: Record<string, unknown>;
   signal: AbortSignal;
   ffmpeg: string;
+  /** 待ち行列のスロット（エンジンの合成プロセス）。省略時は 0 */
+  slot?: number;
 }): Promise<{ audio: Buffer; durationMs: number; sampleRate: number }> => {
   const sr = o.engine.sampleRate;
   const p = o.params;
   const parts: Float32Array[] = [silence(p.leadingSilenceMs, sr)];
   for (const [i, sentence] of o.sentences.entries()) {
-    let pcm = await o.engine.synthesize(sentence, o.voice, o.options, o.signal);
+    let pcm = await o.engine.synthesize(sentence, o.voice, o.options, o.signal, o.slot ?? 0);
     if (p.trimSilence) pcm = trimSilence(pcm, sr);
     if (i > 0) parts.push(silence(p.sentencePauseMs, sr));
     parts.push(pcm);
@@ -249,7 +251,7 @@ export class Synthesizer {
 
     // キャッシュを使わない要求は合流しない（毎回作る）
     // 待ち行列での待ちも timeoutSec まで（要求全体のタイムアウトは実行が始まってから数える）
-    const { promise } = this.d.queue.run(useCache ? key : undefined, async stop => {
+    const { promise } = this.d.queue.run(useCache ? key : undefined, async (slot, stop) => {
       const started = performance.now();
       const ac = new AbortController();
       const timer = setTimeout(
@@ -258,7 +260,7 @@ export class Synthesizer {
       );
       const jobSignal = AbortSignal.any([ac.signal, stop]);
       try {
-        const r = await renderAudio({ engine, voice, sentences, params, options: req.options, signal: jobSignal, ffmpeg: this.d.ffmpeg });
+        const r = await renderAudio({ engine, voice, sentences, params, options: req.options, signal: jobSignal, ffmpeg: this.d.ffmpeg, slot });
         // 中断された合成はキャッシュに書かない
         if (jobSignal.aborted) throw jobSignal.reason;
         const synthesisMs = Math.round(performance.now() - started);
@@ -271,7 +273,7 @@ export class Synthesizer {
       } finally {
         clearTimeout(timer);
       }
-    }, { signal, waitTimeoutMs: this.d.timeoutSec * 1000 });
+    }, `${engine.id}/${voice.id}`, { signal, waitTimeoutMs: this.d.timeoutSec * 1000 });
     const r = await promise;
     return {
       audio: r.audio, contentType, engine, voice: voice.id, durationMs: r.durationMs, sampleRate: r.sampleRate,
