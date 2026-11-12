@@ -15,7 +15,7 @@
 ## エラー形式
 
 ```json
-{ "error": { "code": "invalid_request", "message": "speed must be between 0.5 and 1.5", "field": "speed" } }
+{ "error": { "code": "invalid_request", "message": "zenTts.speed must be between 0.5 and 1.5", "field": "zenTts.speed" } }
 ```
 
 | HTTP | code | 意味 |

@@ -673,7 +673,7 @@ components:
               type: string
               description: 問題のフィールド（入れ子は `zenTts.speed` の形）
       examples:
-        - error: { code: invalid_request, message: speed must be between 0.5 and 1.5, field: zenTts.speed }
+        - error: { code: invalid_request, message: zenTts.speed must be between 0.5 and 1.5, field: zenTts.speed }
     Health:
       type: object
       additionalProperties: false

@@ -25,7 +25,7 @@
 
 ## クイックスタート
 
-Node.js 26.12.1 以上が必要です。wav 以外の形式で出すときは ffmpeg も要ります。
+Node.js 26.12.1 以上が必要です。wav 以外の形式と、サンプリングレートの変更には ffmpeg も必要です。
 
 ```sh
 git clone https://github.com/ShinoharaTa/tts-gateway.git
