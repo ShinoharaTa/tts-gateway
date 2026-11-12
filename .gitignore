@@ -1,0 +1,16 @@
+node_modules/
+
+# ZEN-TTS の重み（再配布できない。公式 CDN から各自で取得する）
+*.ztm
+*.part
+
+# 秘密・環境ごとの設定
+.env
+.env.*
+!.env.example
+
+# データ・キャッシュ（既定はリポジトリの外。TTS_DATA_DIR / TTS_CACHE_DIR をリポジトリ内に向けたとき用）
+data/
+cache/
+*.tmp
+*.log

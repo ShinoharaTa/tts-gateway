@@ -1,0 +1,25 @@
+# tts-gateway の systemd ユーザーユニットの例（docs/design.md「systemd」）。
+# 置き場所: ~/.config/systemd/user/tts-gateway.service
+# WorkingDirectory はリポジトリを置いた場所に、ExecStart の node は自分の Node 26.12.1 以上のパスに合わせる。
+# 環境変数は ~/.config/tts-gateway/env（.env.example を参照。リポジトリに入れない）。
+[Unit]
+Description=tts-gateway (ZEN-TTS HTTP API)
+# tailscale0 が後から上がっても、サーバーが IP ごとに 5 秒おきに bind を再試行する（user unit から tailscaled.service への順序付けは効かない）
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/tts-gateway
+EnvironmentFile=%h/.config/tts-gateway/env
+# mp3 / opus / m4a / flac に使う ffmpeg を探す PATH（~/.local/bin に置いた場合も含める。FFMPEG で絶対パスを指定してもよい）
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.nvm/versions/node/v26.12.1/bin/node src/cli.ts serve
+Restart=on-failure
+RestartSec=5
+Nice=10
+CPUQuota=150%
+MemoryHigh=600M
+MemoryMax=800M
+
+[Install]
+WantedBy=default.target
