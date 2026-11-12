@@ -196,6 +196,15 @@ const showNormalize = async body => {
 // ---- モデル ----
 
 let pollTimer = null;
+let polling = false; // ダウンロード中・検査中のモデルがあり、状態を取りに行っている
+let pollFailures = 0; // ポーリング中の連続失敗回数
+const POLL_FAIL_LIMIT = 5;
+const POLL_FAIL_TEXT = '状態を取得できません。通信を確認してください。';
+
+const schedulePoll = ms => {
+  clearTimeout(pollTimer);
+  pollTimer = setTimeout(loadModels, ms);
+};
 
 const loadModels = async () => {
   try {
@@ -211,12 +220,23 @@ const loadModels = async () => {
         : [h('option', { value: '' }, '追加できるモデルはありません')]),
     );
     $('catalog-form').querySelector('button').disabled = rest.length === 0;
-    const busy = models.some(m => m.status === 'downloading' || m.status === 'verifying');
-    clearTimeout(pollTimer);
-    if (busy) pollTimer = setTimeout(loadModels, 1000);
-    else if (models.some(m => m.status === 'installed')) void loadVoices().catch(() => {});
+    if (pollFailures >= POLL_FAIL_LIMIT) setMsg('models-msg', '');
+    pollFailures = 0;
+    polling = models.some(m => m.status === 'downloading' || m.status === 'verifying');
+    if (polling) schedulePoll(1000);
+    else {
+      clearTimeout(pollTimer);
+      if (models.some(m => m.status === 'installed')) void loadVoices().catch(() => {});
+    }
   } catch (e) {
-    setMsg('models-msg', errText(e), 'error');
+    if (!polling) {
+      setMsg('models-msg', errText(e), 'error');
+      return;
+    }
+    // ポーリング中の失敗では止めない。続けて失敗したら知らせて間隔を空ける
+    pollFailures += 1;
+    if (pollFailures >= POLL_FAIL_LIMIT) setMsg('models-msg', POLL_FAIL_TEXT, 'error');
+    schedulePoll(pollFailures >= POLL_FAIL_LIMIT ? 5000 : 1000);
   }
 };
 
@@ -294,14 +314,20 @@ const addModel = async body => {
 
 let dictEntries = [];
 
+const DICT_LIMIT = 300;
+let dictFilterTimer = null;
+
 const renderDict = () => {
   const q = $('dict-filter').value.trim().toLowerCase();
-  const list = dictEntries.filter(e => !q || e.surface.toLowerCase().includes(q) || e.reading.includes(q));
+  const list = dictEntries.filter(e => !q || e.surface.toLowerCase().includes(q) || e.reading.toLowerCase().includes(q));
   $('dict-count').textContent = `${list.length} / ${dictEntries.length} 語`;
+  const more = $('dict-more');
+  more.textContent = list.length > DICT_LIMIT ? `${list.length} 件中 ${DICT_LIMIT} 件を表示。絞り込むと残りを探せます。` : '';
+  more.hidden = list.length <= DICT_LIMIT;
   // ユーザーの語を先に
   list.sort((a, b) => (a.source === b.source ? 0 : a.source === 'user' ? -1 : 1));
   $('dict').replaceChildren(
-    ...list.slice(0, 300).map(e =>
+    ...list.slice(0, DICT_LIMIT).map(e =>
       h(
         'li',
         {},
@@ -339,6 +365,7 @@ const loadDict = async () => {
 };
 
 const removeReading = async surface => {
+  if (!confirm(`「${surface}」を辞書から削除しますか？`)) return;
   try {
     const d = await api(`/v1/admin/dictionary/${encodeURIComponent(surface)}`, { method: 'DELETE' });
     dictEntries = d.entries;
@@ -439,7 +466,10 @@ document.addEventListener('DOMContentLoaded', () => {
       setMsg('dict-msg', errText(e), 'error');
     }
   });
-  $('dict-filter').addEventListener('input', renderDict);
+  $('dict-filter').addEventListener('input', () => {
+    clearTimeout(dictFilterTimer);
+    dictFilterTimer = setTimeout(renderDict, 150);
+  });
 
   $('settings-form').addEventListener('submit', saveSettings);
   $('cache-clear').addEventListener('click', async () => {
