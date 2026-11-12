@@ -143,7 +143,7 @@ paths:
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
         '422':
-          $ref: '#/components/responses/ModelNotInstalled'
+          $ref: '#/components/responses/Unprocessable'
         '429':
           $ref: '#/components/responses/QueueFull'
         '500':
@@ -502,8 +502,8 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
-    ModelNotInstalled:
-      description: 声は登録済みだが重みが未取得
+    Unprocessable:
+      description: 声は登録済みだが重みが未取得（model_not_installed）、または読み上げられない長さの語が含まれる（unprocessable_text）
       content:
         application/json:
           schema:
@@ -563,6 +563,7 @@ components:
                 - text_too_long
                 - unsupported_media_type
                 - model_not_installed
+                - unprocessable_text
                 - queue_full
                 - internal_error
                 - engine_unavailable

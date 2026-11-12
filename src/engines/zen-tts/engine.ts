@@ -7,19 +7,33 @@
  * - そのスロットの子と別の声の文が来たら、その子を終了してその声で起動し直す（待ちは FIFO）
  * - スロットごとに、idleUnloadSec 使われなければその子を終了してメモリを返す（0 は解放しない）
  * - 子が落ちたら合成中の文は 503。次の文で起動し直す。1 文 30 秒を超えたら子を終了して 504
+ * - 1 回の合成の上限（字数・音素数・フレーム数）を超えた文は SentenceTooLongError（子はそのまま使う。分割は synthesize.ts）
+ * - 子の error イベントは fork 直後から終了まで常に受ける（fork の失敗も 503。プロセスを落とさない）
  * - このファイルは zen-tts を読み込まない（読み込むのは子だけ。親のメモリを増やさない）
  */
 import { fork, type ChildProcess } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { ApiError, invalid } from '../../errors.ts';
 import type { ModelRecord, Registry } from '../../models/registry.ts';
 import type { Settings } from '../../settings.ts';
 import { checkBool, checkEnum, checkInt, checkKeys, checkNumber, checkObject, checkString } from '../../validate.ts';
-import type { Engine, EngineStatus, VoiceInfo } from '../types.ts';
+import { SentenceTooLongError, type Engine, type EngineStatus, type VoiceInfo } from '../types.ts';
 
 export const ENGINE_ID = 'zen-tts';
-export const ZEN_TTS_VERSION = '1.3.0';
+
+/** node_modules/zen-tts/package.json の version（読めなければ 'unknown'）。zen-tts 本体は読み込まない */
+const readZenTtsVersion = (): string => {
+  try {
+    const path = createRequire(import.meta.url).resolve('zen-tts/package.json');
+    const v = (JSON.parse(readFileSync(path, 'utf8')) as { version?: unknown }).version;
+    return typeof v === 'string' && v ? v : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+};
+export const ZEN_TTS_VERSION = readZenTtsVersion();
 export const SAMPLE_RATE = 44100;
 export const CREDIT = {
   ja: '音声合成：ZEN-TTS（https://zenryokukikai.com）',
@@ -258,13 +272,16 @@ export class ZenTtsEngine implements Engine {
     const abortReason = (): Error =>
       signal.reason instanceof ApiError ? signal.reason : timeout('synthesis was aborted');
     if (signal.aborted) throw abortReason();
-    const child = await this.acquire(voice, Math.min(Math.max(0, slot), this.poolSize - 1), signal, abortReason);
+    const s = Math.min(Math.max(0, slot), this.poolSize - 1);
+    let child: Child | undefined;
+    // 待ち・読み込み中の中断や失敗でも、そのスロットのアイドル解放を張り直す
     try {
+      child = await this.acquire(voice, s, signal, abortReason);
       return await this.speakOn(child, sentence, opts, signal, abortReason);
     } finally {
-      if (child.state === 'busy') child.state = 'idle';
+      if (child?.state === 'busy') child.state = 'idle';
       this.schedule();
-      this.armIdle(child.slot);
+      this.armIdle(s);
     }
   }
 
@@ -299,13 +316,21 @@ export class ZenTtsEngine implements Engine {
 
   // ---- 内部 ----
 
+  /** fork する。同期の失敗は 503。error イベントを常に受けるハンドラを付ける（個々の失敗の扱いは waitReady・spawn） */
   private forkChild(): ChildProcess {
-    return fork(this.childPath, [], {
-      serialization: 'advanced',
-      // 親の --test などを引き継がない
-      execArgv: [],
-      stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
-    });
+    let proc: ChildProcess;
+    try {
+      proc = fork(this.childPath, [], {
+        serialization: 'advanced',
+        // 親の --test などを引き継がない
+        execArgv: [],
+        stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+      });
+    } catch (e) {
+      throw unavailable(`failed to start synthesis process: ${(e as Error).message}`);
+    }
+    proc.on('error', e => console.error(`synthesis process error: ${e.message}`));
+    return proc;
   }
 
   /** load を送り、ready を待つ */
@@ -398,8 +423,22 @@ export class ZenTtsEngine implements Engine {
     }
   }
 
+  /** この子を待っている要求（同じスロット・同じ声）を失敗させる。他のスロットの待ちには触れない */
+  private rejectWaiters(slot: number, voiceId: string, e: Error): void {
+    for (const w of this.waiters.filter(x => x.slot === slot && x.voice.id === voiceId)) {
+      this.waiters.splice(this.waiters.indexOf(w), 1);
+      w.reject(e);
+    }
+  }
+
   private spawn(voice: ModelRecord, slot: number): void {
-    const proc = this.forkChild();
+    let proc: ChildProcess;
+    try {
+      proc = this.forkChild();
+    } catch (e) {
+      this.rejectWaiters(slot, voice.id, e as Error);
+      return;
+    }
     const child: Child = { proc, slot, voiceId: voice.id, state: 'starting', kernel: null, job: null, stopping: false };
     this.children.push(child);
     const modelPath = this.registry.modelPath(this.id, voice.id, this.modelExt);
@@ -408,11 +447,12 @@ export class ZenTtsEngine implements Engine {
         if (!this.children.includes(child)) return;
         child.kernel = ready.kernel;
         child.state = 'idle';
-        proc.on('message', (m: { type: string; id?: number; pcm?: Float32Array; message?: string }) => {
+        proc.on('message', (m: { type: string; id?: number; pcm?: Float32Array; message?: string; kind?: string }) => {
           const job = child.job;
           if (!job || job.id !== m.id) return;
           child.job = null;
           if (m.type === 'result') job.resolve(m.pcm!);
+          else if (m.kind === 'sentence_too_long') job.reject(new SentenceTooLongError(m.message ?? 'sentence is too long'));
           else job.reject(unavailable(`synthesis failed: ${m.message}`));
         });
         const onGone = (e: Error): void => {
@@ -426,16 +466,15 @@ export class ZenTtsEngine implements Engine {
         proc.on('exit', (code, sig) => onGone(unavailable(`synthesis process exited (${sig ?? `code ${code}`})`)));
         proc.on('error', e => onGone(unavailable(`synthesis process failed: ${e.message}`)));
         this.schedule();
+        // 待っていた要求が中断済みなら誰も使わないので、アイドル解放を張る
+        this.armIdle(slot);
       },
       (e: Error) => {
         proc.kill('SIGKILL');
         if (child.stopping || !this.children.includes(child)) return;
         this.drop(child);
-        // この子を待っている要求（同じスロット・同じ声）は同じ理由で失敗する。他のスロットの待ちには触れない
-        for (const w of this.waiters.filter(x => x.slot === slot && x.voice.id === voice.id)) {
-          this.waiters.splice(this.waiters.indexOf(w), 1);
-          w.reject(e);
-        }
+        // この子を待っている要求は同じ理由で失敗する
+        this.rejectWaiters(slot, voice.id, e);
         this.schedule();
       },
     );

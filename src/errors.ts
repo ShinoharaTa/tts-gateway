@@ -11,6 +11,7 @@ export type ErrorCode =
   | 'text_too_long'
   | 'unsupported_media_type'
   | 'model_not_installed'
+  | 'unprocessable_text'
   | 'queue_full'
   | 'internal_error'
   | 'engine_unavailable'

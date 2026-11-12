@@ -7,7 +7,7 @@ import { ApiError, invalid, notFound } from './errors.ts';
 import type { AudioCache } from './cache.ts';
 import { CONTENT_TYPES, DEFAULT_BITRATES, encode, outputSampleRate } from './audio/encode.ts';
 import { applyGain, concat, samplesToMs, silence, trimSilence } from './audio/pcm.ts';
-import type { Engine } from './engines/types.ts';
+import { SentenceTooLongError, type Engine } from './engines/types.ts';
 import type { ModelRecord, Registry } from './models/registry.ts';
 import type { SynthQueue } from './queue.ts';
 import type { SettingsStore } from './settings.ts';
@@ -127,6 +127,52 @@ export const cacheKey = (o: {
 
 // ---- 音声を作る ----
 
+/** 1 回の合成の上限を超えた文を割り直す深さの上限（最大 2^4 = 16 片） */
+export const MAX_SPLIT_DEPTH = 4;
+/** 割る位置にする文字（読点・空白・中黒） */
+const SPLIT_AT_RE = /[、，, 　・]/;
+
+/** 文を 2 つに割る。中央に最も近い読点・空白・中黒の後（無ければ中央のコードポイント境界）。1 文字なら null */
+export const splitInHalf = (sentence: string): [string, string] | null => {
+  const chars = [...sentence];
+  if (chars.length < 2) return null;
+  const mid = chars.length / 2;
+  let cut = Math.floor(mid);
+  let best = Infinity;
+  for (let i = 0; i < chars.length - 1; i++) {
+    if (SPLIT_AT_RE.test(chars[i]!) && Math.abs(i + 1 - mid) < best) {
+      best = Math.abs(i + 1 - mid);
+      cut = i + 1;
+    }
+  }
+  return [chars.slice(0, cut).join(''), chars.slice(cut).join('')];
+};
+
+/**
+ * 1 文を合成する。エンジンの上限を超えたら（SentenceTooLongError）半分に割ってそれぞれ合成し、無音を挟まずにつなぐ。
+ * MAX_SPLIT_DEPTH 段割っても、1 文字まで割っても超えるなら 422 unprocessable_text
+ */
+export const synthesizeSentence = async (
+  o: { engine: Engine; voice: ModelRecord; options: Record<string, unknown>; signal: AbortSignal; slot: number },
+  sentence: string,
+  depth = 0,
+): Promise<Float32Array> => {
+  try {
+    return await o.engine.synthesize(sentence, o.voice, o.options, o.signal, o.slot);
+  } catch (e) {
+    if (!(e instanceof SentenceTooLongError)) throw e;
+    const halves = depth < MAX_SPLIT_DEPTH ? splitInHalf(sentence) : null;
+    if (!halves) throw new ApiError(422, 'unprocessable_text', 'text contains a word too long to read');
+    const parts: Float32Array[] = [];
+    for (const half of halves) {
+      // 割った片の端の空白は落とし、読める文字の無い片は飛ばす
+      const piece = half.trim();
+      if (piece && SPEAKABLE_RE.test(piece)) parts.push(await synthesizeSentence(o, piece, depth + 1));
+    }
+    return concat(parts);
+  }
+};
+
 /** 文を順に合成し、無音・連結・音量を経てエンコードする */
 export const renderAudio = async (o: {
   engine: Engine;
@@ -143,7 +189,7 @@ export const renderAudio = async (o: {
   const p = o.params;
   const parts: Float32Array[] = [silence(p.leadingSilenceMs, sr)];
   for (const [i, sentence] of o.sentences.entries()) {
-    let pcm = await o.engine.synthesize(sentence, o.voice, o.options, o.signal, o.slot ?? 0);
+    let pcm = await synthesizeSentence({ ...o, slot: o.slot ?? 0 }, sentence);
     if (p.trimSilence) pcm = trimSilence(pcm, sr);
     if (i > 0) parts.push(silence(p.sentencePauseMs, sr));
     parts.push(pcm);

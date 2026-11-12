@@ -25,6 +25,7 @@
 | 413 | `text_too_long` | `text` が上限（既定 2,000 字）を超えた |
 | 415 | `unsupported_media_type` | JSON 以外の本文 |
 | 422 | `model_not_installed` | 声は登録済みだが重みが未取得 |
+| 422 | `unprocessable_text` | 読み上げられない長さの語が含まれる（1 回の合成の上限を超える文を割り直しても収まらない） |
 | 429 | `queue_full` | 待ち行列が満杯。`Retry-After` ヘッダ（秒）付き |
 | 500 | `internal_error` | 想定外の失敗 |
 | 503 | `engine_unavailable` | モデル読み込み・合成プロセスの失敗 |
