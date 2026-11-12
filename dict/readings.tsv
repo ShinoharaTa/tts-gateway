@@ -1,0 +1,189 @@
+# tts-gateway の組み込みの読み辞書。surface<TAB>reading（# で始まる行はコメント）。
+# 照合は NFKC + 大文字小文字を同一視、英数字の語は単語境界、長い surface から。全部大文字で 5 字以内（API, AWS, GPU）は
+# 頭字語として置き換えない（ZEN-TTS の略語規則に任せる）ので書かない。読みは全角カタカナ・長音符・中黒・空白だけ。
+# 利用者ごとの追加・上書きはユーザー辞書（データディレクトリの readings.tsv。設定画面の「読み辞書」）で行う。
+#
+# Apple
+iPhone	アイフォーン
+iPad	アイパッド
+iPadOS	アイパッドオーエス
+iOS	アイオーエス
+macOS	マックオーエス
+Mac	マック
+MacBook	マックブック
+MacBook Air	マックブックエア
+MacBook Pro	マックブックプロ
+iMac	アイマック
+Apple	アップル
+Apple Watch	アップルウォッチ
+AirPods	エアーポッズ
+Vision Pro	ビジョンプロ
+Safari	サファリ
+Siri	シリ
+iCloud	アイクラウド
+Xcode	エックスコード
+Swift	スウィフト
+# Google
+Google	グーグル
+Gemini	ジェミニ
+Pixel	ピクセル
+Android	アンドロイド
+Chrome	クローム
+Chromebook	クロームブック
+Gmail	ジーメール
+YouTube	ユーチューブ
+DeepMind	ディープマインド
+Google DeepMind	グーグルディープマインド
+Gemma	ジェマ
+Waymo	ウェイモ
+Firebase	ファイアベース
+Kotlin	コトリン
+Flutter	フラッター
+# Microsoft
+Microsoft	マイクロソフト
+Windows	ウィンドウズ
+Copilot	コパイロット
+GitHub	ギットハブ
+GitHub Copilot	ギットハブコパイロット
+Azure	アジュール
+Office	オフィス
+Excel	エクセル
+Teams	チームズ
+Xbox	エックスボックス
+Visual Studio	ビジュアルスタジオ
+Edge	エッジ
+LinkedIn	リンクトイン
+# Amazon
+Amazon	アマゾン
+Bedrock	ベッドロック
+Amazon Bedrock	アマゾンベッドロック
+Lambda	ラムダ
+Alexa	アレクサ
+Kindle	キンドル
+# AI
+OpenAI	オープンエーアイ
+ChatGPT	チャットジーピーティー
+Codex	コーデックス
+Sora	ソラ
+Anthropic	アンソロピック
+Claude	クロード
+Claude Code	クロードコード
+Opus	オーパス
+Sonnet	ソネット
+Haiku	ハイク
+Fable	フェイブル
+Hugging Face	ハギングフェイス
+Mistral	ミストラル
+Llama	ラマ
+Qwen	クウェン
+DeepSeek	ディープシーク
+Perplexity	パープレキシティ
+Midjourney	ミッドジャーニー
+Stable Diffusion	ステーブルディフュージョン
+Cursor	カーソル
+Grok	グロック
+Sakana AI	サカナエーアイ
+xAI	エックスエーアイ
+# 半導体・ハード
+Nvidia	エヌビディア
+Intel	インテル
+Qualcomm	クアルコム
+Snapdragon	スナップドラゴン
+Arm	アーム
+Samsung	サムスン
+Galaxy	ギャラクシー
+Xiaomi	シャオミ
+Huawei	ファーウェイ
+Sony	ソニー
+PlayStation	プレイステーション
+Nintendo	ニンテンドー
+Switch	スイッチ
+Raspberry Pi	ラズベリーパイ
+Tesla	テスラ
+SpaceX	スペースエックス
+Starlink	スターリンク
+# その他の企業・サービス
+Meta	メタ
+Facebook	フェイスブック
+Instagram	インスタグラム
+WhatsApp	ワッツアップ
+Threads	スレッズ
+Twitter	ツイッター
+Cloudflare	クラウドフレア
+Cloudflare Workers	クラウドフレアワーカーズ
+Oracle	オラクル
+Salesforce	セールスフォース
+Shopify	ショッピファイ
+Slack	スラック
+Discord	ディスコード
+Zoom	ズーム
+Notion	ノーション
+Figma	フィグマ
+Adobe	アドビ
+Netflix	ネットフリックス
+Spotify	スポティファイ
+Uber	ウーバー
+Dropbox	ドロップボックス
+Tailscale	テイルスケール
+Firefox	ファイアフォックス
+Mozilla	モジラ
+Linux	リナックス
+Ubuntu	ウブントゥ
+Docker	ドッカー
+Kubernetes	クバネティス
+Vercel	バーセル
+Stripe	ストライプ
+Qiita	キータ
+Zenn	ゼン
+# 言語・技術
+Python	パイソン
+Rust	ラスト
+TypeScript	タイプスクリプト
+JavaScript	ジャバスクリプト
+Java	ジャバ
+Ruby	ルビー
+React	リアクト
+Next.js	ネクストジェイエス
+Node.js	ノードジェイエス
+Deno	ディーノ
+WebAssembly	ウェブアセンブリ
+PostgreSQL	ポストグレスキューエル
+Postgres	ポストグレス
+SQLite	エスキューライト
+Redis	レディス
+# 一般語
+token	トークン
+tokens	トークン
+Pro	プロ
+Max	マックス
+Ultra	ウルトラ
+Plus	プラス
+Mini	ミニ
+Air	エア
+Lite	ライト
+Flash	フラッシュ
+Preview	プレビュー
+Beta	ベータ
+Agent	エージェント
+Agents	エージェント
+agentic	エージェンティック
+Cloud	クラウド
+Studio	スタジオ
+Live	ライブ
+Thinking	シンキング
+Deep Research	ディープリサーチ
+open source	オープンソース
+benchmark	ベンチマーク
+prompt	プロンプト
+# AI・開発
+VOICEVOX	ボイスボックス
+ZEN-TTS	ゼンティーティーエス
+Ollama	オラマ
+Whisper	ウィスパー
+systemd	システムディー
+push	プッシュ
+pull	プル
+commit	コミット
+merge	マージ
+issue	イシュー
+deploy	デプロイ
