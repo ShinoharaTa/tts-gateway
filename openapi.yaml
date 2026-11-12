@@ -491,7 +491,7 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
     TextTooLong:
-      description: text が上限（TTS_MAX_CHARS、既定 2,000 字）を超えた
+      description: text が上限（TTS_MAX_CHARS、既定 2,000 字）を超えた。または前処理と読み辞書を通した後の文が上限の 3 倍（既定 6,000 字）を超えた
       content:
         application/json:
           schema:
@@ -886,7 +886,7 @@ components:
           default: true
         readings:
           type: object
-          description: この要求だけの読み辞書の追加・上書き（最大 200 語。読みはカタカナ）
+          description: この要求だけの読み辞書の追加・上書き（最大 200 語。読みはカタカナ。語・読みはそれぞれ 100 字まで）
           maxProperties: 200
           default: {}
           propertyNames:
@@ -894,6 +894,7 @@ components:
             maxLength: 100
           additionalProperties:
             type: string
+            maxLength: 100
             pattern: '^[\p{Script=Katakana}ー・ ]+$'
         cache:
           type: boolean
@@ -979,6 +980,7 @@ components:
       properties:
         reading:
           type: string
+          maxLength: 100
           pattern: '^[\p{Script=Katakana}ー・ ]+$'
     EngineStatus:
       type: object
