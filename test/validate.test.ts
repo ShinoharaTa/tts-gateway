@@ -97,6 +97,11 @@ test('readings: 最大 200 語・読みはカタカナ', () => {
   assert.deepEqual(ok.readings, { Foo: 'フー' });
   rejects({ text: 'a', readings: { Foo: 'ふー' } }, 400, 'invalid_request', 'readings.Foo');
   rejects({ text: 'a', readings: { '': 'フー' } }, 400, 'invalid_request');
+  rejects({ text: 'a', readings: { Foo: 'ﾌｰ' } }, 400, 'invalid_request', 'readings.Foo');
+  // # で始まる語は readings.tsv でコメントになるので受け付けない（全角の ＃ も NFKC で #）
+  rejects({ text: 'a', readings: { '#Foo': 'フー' } }, 400, 'invalid_request', 'readings.#Foo');
+  rejects({ text: 'a', readings: { ' ＃Foo': 'フー' } }, 400, 'invalid_request', 'readings. ＃Foo');
+  assert.deepEqual(validateSynthRequest({ text: 'a', readings: { 'C#': 'シーシャープ' } }, ctx).readings, { 'C#': 'シーシャープ' });
   rejects({ text: 'a', readings: [] }, 400, 'invalid_request', 'readings');
   const many = Object.fromEntries(Array.from({ length: 201 }, (_, i) => [`w${i}`, 'ワ']));
   rejects({ text: 'a', readings: many }, 400, 'invalid_request', 'readings');

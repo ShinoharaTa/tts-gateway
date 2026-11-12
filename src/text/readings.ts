@@ -1,9 +1,12 @@
 /**
- * 読み辞書（英字の語 → カタカナ）。前処理（spoken.ts）の後で、文の語を読みに置き換える（docs/api.md「読み辞書の規則」）。
+ * 読み辞書（英字の語 → カタカナ）。前処理の前の段（spoken.ts の beforeReadings: NFKC・URL とメールの削除）と
+ * 後の段（afterReadings: 記号の規則）の間で、文の語を読みに置き換える（docs/api.md「読み辞書の規則」）。
  *
  * - 照合は NFKC + 大文字小文字を同一視。単語境界は、前が英数字でないこと・後ろが英字でないこと（iPhone16 → アイフォーン16）。
- *   長い surface から当てる（Hugging Face を Hugging より先に）。URL・メールアドレス・ドメイン（example.com）の中は置き換えない
- * - 全部大文字で 5 字以内の語（API, AWS, GPU, PS5）は頭字語として置き換えない（ZEN-TTS の略語規則に任せる）
+ *   長い surface から当てる（Hugging Face を Hugging より先に）。URL・メールアドレス・ドメイン（example.com）の中は置き換えない。
+ *   ただし surface 自体がドットを含む語（Character.AI、Booking.com）はドメインの形でも当てる
+ * - 登録した語は全部大文字でも置き換える（NASA、API）。未知語の候補からは全部大文字 3 字以内（API, GPU）を除く（ZEN-TTS が綴りで読む）
+ * - surface の語の間の空白は改行をまたがない（行末の MacBook と次の行頭の Pro を 1 語にしない）
  * - 置き換えた語の直後の所有格 's は消し、「-数字」「-英字」はハイフンを空白にする（Pixel-9 → ピクセル 9。マイナスと読ませない）
  * - 辞書は 組み込み（dict/readings.tsv）・ユーザー（データディレクトリの readings.tsv）・要求ごと（readings）の 3 つ。
  *   同じ語なら 要求 → ユーザー → 組み込み の順で優先する
@@ -23,11 +26,14 @@ export const normalizeSurface = (s: string): string => s.normalize('NFKC').trim(
 /** 照合のキー（大文字小文字を同一視） */
 export const surfaceKey = (s: string): string => normalizeSurface(s).toLowerCase();
 
-/** 全部大文字で 5 字以内（数字を含んでよい。先頭は英字）。綴りで読むので置き換えない */
+/** 全部大文字で 5 字以内（数字を含んでよい。先頭は英字）。ユーザー辞書への登録を断るのに使う（server.ts） */
 export const isAcronym = (word: string): boolean => /^[A-Z][A-Z0-9]{0,4}$/.test(word);
 
-/** 読みとして受け付ける形（カタカナ・長音符・中黒・空白） */
-export const isReading = (s: string): boolean => /^[\p{Script=Katakana}ー・ ]+$/u.test(s) && /\p{Script=Katakana}/u.test(s);
+/** 全部大文字で 3 字以内（API, GPU）。ZEN-TTS が綴りで読むので未知語の候補にしない */
+const isSpelledAcronym = (word: string): boolean => /^[A-Z]{1,3}$/.test(word);
+
+/** 読みとして受け付ける形（全角カタカナ・長音符・中黒・空白。半角カナは不可） */
+export const isReading = (s: string): boolean => /^[\u30A1-\u30FA\u30FD\u30FEー・ ]+$/.test(s) && /[\u30A1-\u30FA]/.test(s);
 
 const ALNUM_RE = /[A-Za-z0-9]/;
 const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -39,9 +45,9 @@ const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 export const DOMAIN_RE =
   /(?<![A-Za-z0-9@.-])(?:[A-Za-z0-9-]+\.)+(?:com|net|org|io|ai|dev|app|jp|co|me|tv|gg|so|sh|xyz|info|cloud|tech)(?![A-Za-z0-9-])(?:\/[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]*)?/gi;
 
-/** surface 1 つの正規表現。空白は 1 つ以上の空白に。先頭が英数字なら前が英数字でないとき、末尾が英字なら後ろが英字でないとき（iPhone16 は当てる） */
+/** surface 1 つの正規表現。空白は 1 つ以上の空白（改行は含めない）に。先頭が英数字なら前が英数字でないとき、末尾が英字なら後ろが英字でないとき（iPhone16 は当てる） */
 const surfacePattern = (surface: string): string => {
-  const body = surface.split(' ').map(escapeRe).join('\\s+');
+  const body = surface.split(' ').map(escapeRe).join('[ \\t\\u3000]+');
   const head = ALNUM_RE.test(surface[0]!) ? '(?<![A-Za-z0-9])' : '';
   const last = surface.at(-1)!;
   const tail = /[A-Za-z]/.test(last) ? '(?![A-Za-z])' : /\d/.test(last) ? '(?![A-Za-z0-9])' : '';
@@ -67,7 +73,7 @@ export type Readings = {
   apply: (text: string) => string;
   /** texts で実際に当たった語（キー → 読み。当たった順） */
   hits: (texts: readonly string[]) => Hit[];
-  /** 辞書に無い、小文字を含む英単語（所有格 's は落とす）。多い順 */
+  /** 辞書に無い英単語（所有格 's は落とす。全部大文字 3 字以内は除く）。多い順 */
   unknownWords: (texts: readonly string[]) => UnknownWord[];
 };
 
@@ -83,7 +89,7 @@ export const compileReadings = (rows: readonly ReadingRow[]): Readings => {
     const key = surface.toLowerCase();
     known.add(key);
     const reading = row.reading.trim();
-    if (!isReading(reading) || isAcronym(surface)) continue;
+    if (!isReading(reading)) continue;
     const rank = SOURCE_RANK[row.source] ?? 3;
     const prev = chosen.get(key);
     if (!prev || rank <= prev.rank) chosen.set(key, { surface, reading, source: row.source, rank });
@@ -91,10 +97,16 @@ export const compileReadings = (rows: readonly ReadingRow[]): Readings => {
   const sorted = [...chosen.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   const version = sha256(sorted.map(([key, e]) => `${key}\t${e.reading}`));
   const byLength = sorted.map(([, e]) => e.surface).sort((a, b) => b.length - a.length);
+  // ドットを含む surface（Character.AI）はドメインより先に試す。ただし長いドメインの一部（character.ai.example.com）は除く。
+  // それ以外はドメインの後（example.com の example は当てない）
+  const dotted = byLength.filter(s => s.includes('.'));
+  const plain = byLength.filter(s => !s.includes('.'));
+  const group = (list: string[]): string => (list.length ? list.map(surfacePattern).join('|') : '(?!)');
+  const dottedGroup = dotted.length ? `(?<![.@])(?:${group(dotted)})(?!\\.[A-Za-z0-9])` : '(?!)';
   // 語の直後: 所有格 's は消す（Apple's → アップル）。-数字・-英字のハイフンは空白にする（Pixel-9 → ピクセル 9、Mac-mini → マック ミニ）
   const re = byLength.length
     ? new RegExp(
-        `(${URL_RE.source})|(${EMAIL_RE.source})|(${DOMAIN_RE.source})|(${byLength.map(surfacePattern).join('|')})` +
+        `(${URL_RE.source})|(${EMAIL_RE.source})|(${dottedGroup})|(${DOMAIN_RE.source})|(${group(plain)})` +
           `(?:(['’]s(?![A-Za-z]))|(-(?=[A-Za-z0-9])))?`,
         'giu',
       )
@@ -106,9 +118,10 @@ export const compileReadings = (rows: readonly ReadingRow[]): Readings => {
     if (!re) return nfkc;
     return nfkc.replace(
       re,
-      (m: string, url?: string, email?: string, domain?: string, word?: string, _possessive?: string, hyphen?: string) => {
-        if (url || email || domain || !word || isAcronym(word)) return m;
-        const key = word.replace(/\s+/g, ' ').toLowerCase();
+      (m: string, url?: string, email?: string, dottedWord?: string, domain?: string, plainWord?: string, _possessive?: string, hyphen?: string) => {
+        const word = dottedWord || plainWord;
+        if (url || email || domain || !word) return m;
+        const key = word.replace(/[ \t\u3000]+/g, ' ').toLowerCase();
         const e = chosen.get(key);
         if (!e) return m;
         onHit?.(key, e.reading);
@@ -131,7 +144,7 @@ export const compileReadings = (rows: readonly ReadingRow[]): Readings => {
       const rest = apply(text).replace(URL_RE, ' ').replace(EMAIL_RE, ' ').replace(DOMAIN_RE, ' ');
       for (const [match] of rest.matchAll(WORD_RE)) {
         const word = match.replace(/['’]s$/, '');
-        if (word.length < 2 || !/[a-z]/.test(word) || isAcronym(word)) continue;
+        if (word.length < 2 || isSpelledAcronym(word)) continue;
         const key = word.toLowerCase();
         if (known.has(key)) continue;
         const hit = counts.get(key);

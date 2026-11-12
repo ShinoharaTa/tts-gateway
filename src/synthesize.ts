@@ -1,5 +1,5 @@
 /**
- * 合成の流れ: 前処理（spoken.ts）→ 読み辞書（readings.ts）→ 文分割 → エンジン（1 文ずつ）→ 無音処理・連結・音量 → エンコード。
+ * 合成の流れ: 前処理の前段（spoken.ts。NFKC・URL とメールの削除）→ 読み辞書（readings.ts）→ 前処理の後段（記号の規則）→ 文分割 → エンジン（1 文ずつ）→ 無音処理・連結・音量 → エンコード。
  * キャッシュ（cache.ts）と待ち行列（queue.ts）もここでつなぐ。
  */
 import { createHash } from 'node:crypto';
@@ -12,7 +12,7 @@ import type { ModelRecord, Registry } from './models/registry.ts';
 import type { SynthQueue } from './queue.ts';
 import type { SettingsStore } from './settings.ts';
 import type { Dictionary, Hit, UnknownWord } from './text/readings.ts';
-import { toSpoken } from './text/spoken.ts';
+import { afterReadings, beforeReadings } from './text/spoken.ts';
 import { validateSynthRequest, type SynthRequest } from './validate.ts';
 
 // ---- 文分割 ----
@@ -66,9 +66,11 @@ export const splitSentences = (text: string, maxChars: number): string[] => {
 export type Prepared = { spoken: string; sentences: string[]; hits: Hit[]; unknownWords: UnknownWord[] };
 
 export const prepareText = (req: Pick<SynthRequest, 'text' | 'preprocess' | 'dictionary' | 'readings' | 'maxSentenceChars'>, dict: Dictionary): Prepared => {
-  const pre = req.preprocess ? toSpoken(req.text) : req.text.normalize('NFKC');
+  // 辞書は記号の規則より先に当てる（GPT-4o・COVID-19 を崩す前に）。normalize と synthesize は同じ順
+  const pre = req.preprocess ? beforeReadings(req.text) : req.text.normalize('NFKC');
   const readings = dict.withRequest(req.readings);
-  const spoken = req.dictionary ? readings.apply(pre) : pre;
+  const replaced = req.dictionary ? readings.apply(pre) : pre;
+  const spoken = req.preprocess ? afterReadings(replaced) : replaced;
   return {
     spoken,
     sentences: splitSentences(spoken, req.maxSentenceChars),

@@ -163,7 +163,7 @@ export const validateSynthRequest = (raw: unknown, ctx: ValidateContext): SynthR
   };
 };
 
-/** 読み辞書の語の形（空でない、100 字以内、タブ・改行を含まない） */
+/** 読み辞書の語の形（空でない、100 字以内、タブ・改行を含まない、# で始まらない） */
 export const MAX_SURFACE_CHARS = 100;
 
 export const checkSurface = (surface: string, field: string): string => {
@@ -171,5 +171,7 @@ export const checkSurface = (surface: string, field: string): string => {
   if (!s) throw invalid(`${field}: surface must not be empty`, field);
   if (charCount(s) > MAX_SURFACE_CHARS) throw invalid(`${field}: surface must be at most ${MAX_SURFACE_CHARS} characters`, field);
   if (/[\t\r\n]/.test(surface)) throw invalid(`${field}: surface must not contain tabs or line breaks`, field);
+  // readings.tsv では # で始まる行はコメントになり、再起動で消える
+  if (s.startsWith('#')) throw invalid(`${field}: surface must not start with #`, field);
   return s;
 };

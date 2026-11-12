@@ -164,3 +164,22 @@ test('Synthesizer.normalize: 読み・文・当たった語・未知語', async 
     await cleanup();
   }
 });
+
+test('Synthesizer: normalize と synthesize は 前処理の前段 → 辞書 → 後段 の順', async () => {
+  const { synth, engine, cleanup } = await setup();
+  try {
+    const readings = { 'GPT-4o': 'ジーピーティーフォーオー', 'COVID-19': 'コビッドナインティーン', NASA: 'ナサ' };
+    const text = 'GPT-4o と COVID-19 と NASA と Pixel-9 は 25%。\nhttps://example.com/a！すごい？';
+    const spoken = 'ジーピーティーフォーオー と コビッドナインティーン と ナサ と ピクセル 9 は 25パーセント。\n!すごい?';
+    const n = synth.normalize({ text, readings });
+    assert.equal(n.spoken, spoken);
+    assert.deepEqual(n.unknownWords, []);
+    await synth.synthesize({ text, readings, cache: false });
+    assert.deepEqual(engine.calls.map(c => c.sentence), n.sentences);
+    assert.equal(n.sentences[0], spoken.split('\n')[0]);
+    // 登録の無い 4 字以上の大文字語は未知語。3 字以内は出ない
+    assert.deepEqual(synth.normalize({ text: 'NASA の API' }).unknownWords, [{ word: 'NASA', count: 1 }]);
+  } finally {
+    await cleanup();
+  }
+});

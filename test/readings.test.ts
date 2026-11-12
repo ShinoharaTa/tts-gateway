@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { PACKAGE_DIR } from '../src/config.ts';
-import { compileReadings, Dictionary, isAcronym, parseReadingsTsv, type ReadingRow } from '../src/text/readings.ts';
+import { compileReadings, Dictionary, isAcronym, isReading, parseReadingsTsv, type ReadingRow } from '../src/text/readings.ts';
 import { tempDir } from './helpers.ts';
 
 const rows = (pairs: [string, string][], source: ReadingRow['source'] = 'builtin'): ReadingRow[] =>
@@ -42,15 +42,23 @@ test('語の境界: 前が英数字でない・後ろが英字でない', () => 
   assert.equal(r.apply('「Mac」'), '「マック」');
 });
 
-test('頭字語（全部大文字で 5 字以内）は置き換えない', () => {
+test('登録した語は全部大文字でも置き換える。未知語からは全部大文字 3 字以内だけ除く', () => {
   assert.equal(isAcronym('API'), true);
   assert.equal(isAcronym('PS5'), true);
   assert.equal(isAcronym('VOICEVOX'), false);
   assert.equal(isAcronym('Api'), false);
-  const r = compileReadings(rows([['Max', 'マックス'], ['GPU', 'ジーピーユー']]));
-  assert.equal(r.apply('MAX と Max'), 'MAX と マックス');
-  assert.equal(r.apply('GPU'), 'GPU');
-  assert.equal(r.size, 1);
+  const r = compileReadings(rows([['Max', 'マックス'], ['GPU', 'ジーピーユー'], ['NASA', 'ナサ']]));
+  assert.equal(r.apply('MAX と Max'), 'マックス と マックス');
+  assert.equal(r.apply('GPU と NASA'), 'ジーピーユー と ナサ');
+  assert.equal(r.size, 3);
+  // 登録なし: 4 字以上の大文字語は未知語、3 字以内は出さない
+  const empty = compileReadings([]);
+  assert.equal(empty.apply('NASA'), 'NASA');
+  assert.deepEqual(empty.unknownWords(['NASA と JSON と API と GPU']), [
+    { word: 'JSON', count: 1 },
+    { word: 'NASA', count: 1 },
+  ]);
+  assert.deepEqual(r.unknownWords(['NASA と API']), [], '登録した NASA は未知語に出ない');
 });
 
 test('URL・メールアドレス・ドメインの中は置き換えない', () => {
@@ -58,6 +66,38 @@ test('URL・メールアドレス・ドメインの中は置き換えない', ()
   assert.equal(r.apply('https://github.com/example を見る'), 'https://github.com/example を見る');
   assert.equal(r.apply('github.com/foo と GitHub'), 'github.com/foo と ギットハブ');
   assert.equal(r.apply('me@example.com に example'), 'me@example.com に エグザンプル');
+});
+
+test('ドットを含む surface はドメインの形でも当てる。辞書に無いドメインの中は置き換えない', () => {
+  const r = compileReadings(
+    rows([['Character.AI', 'キャラクターエーアイ'], ['Booking.com', 'ブッキングドットコム'], ['Node.js', 'ノードジェイエス'], ['example', 'エグザンプル'], ['Character', 'キャラクター']]),
+  );
+  assert.equal(r.apply('Character.AI と Booking.com と Node.js'), 'キャラクターエーアイ と ブッキングドットコム と ノードジェイエス');
+  assert.equal(r.apply('example.com と www.booking.com と character.ai.example.com'), 'example.com と www.booking.com と character.ai.example.com');
+  assert.equal(r.apply('example と Character'), 'エグザンプル と キャラクター');
+  assert.deepEqual(r.hits(['Booking.com']), [{ surface: 'booking.com', reading: 'ブッキングドットコム' }]);
+});
+
+test('語の間の空白は改行をまたがない', () => {
+  const r = compileReadings(rows([['MacBook Pro', 'マックブックプロ'], ['Hugging Face', 'ハギングフェイス']]));
+  assert.equal(r.apply('MacBook\nPro'), 'MacBook\nPro');
+  assert.equal(r.apply('MacBook \r\n Pro'), 'MacBook \r\n Pro');
+  assert.equal(r.apply('MacBook\tPro と Hugging　Face'), 'マックブックプロ と ハギングフェイス');
+});
+
+test('記号や数字を含む surface（GPT-4o・COVID-19）', () => {
+  const r = compileReadings(rows([['GPT-4o', 'ジーピーティーフォーオー'], ['COVID-19', 'コビッドナインティーン']]));
+  assert.equal(r.apply('GPT-4o と COVID-19'), 'ジーピーティーフォーオー と コビッドナインティーン');
+  assert.equal(r.apply('GPT-4omni と COVID-190'), 'GPT-4omni と COVID-190');
+});
+
+test('読みは全角カタカナ・ー・・・空白だけ（半角カナは不可）', () => {
+  assert.equal(isReading('アイフォーン'), true);
+  assert.equal(isReading('ジェフ・ベゾス ニ'), true);
+  assert.equal(isReading('ｱｲｳ'), false);
+  assert.equal(isReading('アイｳ'), false);
+  assert.equal(isReading('ー・'), false);
+  assert.deepEqual(parseReadingsTsv('Foo\tｱｲｳ\nBar\tバー\n'), [{ surface: 'Bar', reading: 'バー', source: 'builtin' }]);
 });
 
 test("所有格 's は消し、-数字・-英字のハイフンは空白にする", () => {
