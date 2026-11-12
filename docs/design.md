@@ -9,6 +9,9 @@ API の外形は [api.md](api.md)。ここは実装の構成と決めごと。
 - 依存は `zen-tts`（`github:zenryokukikai/zen-tts#v1.3.0`）だけ。HTTP は `node:http`、テストは `node --test`。
 - 圧縮形式（mp3 / opus / m4a / flac）とリサンプルは `ffmpeg`（`FFMPEG` 環境変数、既定は PATH の `ffmpeg`）。
   `wav` で `sampleRate` がエンジンの値と同じなら ffmpeg を使わない。
+  起動時に `ffmpeg -version` を試し、無くても起動は続ける（`/v1/admin/status` の `ffmpeg`、起動ログに 1 行）。
+  状態取得・ffmpeg の要る要求のときに、前回から 30 秒以上たっていれば試し直す（同時に 1 本だけ）。
+  無いとき・起動に失敗したとき（spawn の同期 throw、ENOENT / ENOTDIR / EACCES、終了コード 127）は ffmpeg の要る要求を 503 `engine_unavailable` にする。
 
 ## ディレクトリ
 

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
+import { chmod, rm, writeFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -276,5 +277,43 @@ test('models: 追加（URL）→ 取得 → installed、409、削除', async () 
   } finally {
     await c.stop();
     await new Promise<void>(r => origin.close(() => r()));
+  }
+});
+
+test('ffmpeg が無い: mp3 は 503、エンジンのサンプルレートの wav は 200、status に available=false', async () => {
+  const c = await start({ FFMPEG: '/nonexistent/ffmpeg' });
+  try {
+    const st = (await (await fetch(`${c.base}/v1/admin/status`)).json()) as { ffmpeg: unknown };
+    assert.deepEqual(st.ffmpeg, { available: false, path: '/nonexistent/ffmpeg', version: null, reason: 'spawn /nonexistent/ffmpeg ENOENT' });
+    const mp3 = await fetch(`${c.base}/v1/synthesize`, json({ text: 'こんにちは。', format: 'mp3' }));
+    assert.equal(mp3.status, 503);
+    assert.deepEqual(await mp3.json(), { error: { code: 'engine_unavailable', message: 'ffmpeg is not available (/nonexistent/ffmpeg)' } });
+    // リサンプルの要る wav も 503
+    assert.equal((await fetch(`${c.base}/v1/synthesize`, json({ text: 'こんにちは。', sampleRate: 16000 }))).status, 503);
+    assert.equal(c.engine.calls.length, 0);
+    const wav = await fetch(`${c.base}/v1/synthesize`, json({ text: 'こんにちは。', sampleRate: 8000 }));
+    assert.equal(wav.status, 200);
+    assert.equal(wav.headers.get('content-type'), 'audio/wav');
+  } finally {
+    await c.stop();
+  }
+});
+
+test('ffmpeg が probe の後に消えた: mp3 は 500 ではなく 503 engine_unavailable', async () => {
+  const { dir, cleanup } = await tempDir();
+  const fake = join(dir, 'ffmpeg');
+  await writeFile(fake, '#!/bin/sh\necho "ffmpeg version 7.0.2"\n');
+  await chmod(fake, 0o755);
+  const c = await start({ FFMPEG: fake });
+  try {
+    const st = (await (await fetch(`${c.base}/v1/admin/status`)).json()) as { ffmpeg: { available: boolean } };
+    assert.equal(st.ffmpeg.available, true);
+    await rm(fake);
+    const mp3 = await fetch(`${c.base}/v1/synthesize`, json({ text: 'こんにちは。', format: 'mp3' }));
+    assert.equal(mp3.status, 503);
+    assert.deepEqual(await mp3.json(), { error: { code: 'engine_unavailable', message: `ffmpeg is not available (${fake})` } });
+  } finally {
+    await c.stop();
+    await cleanup();
   }
 });
