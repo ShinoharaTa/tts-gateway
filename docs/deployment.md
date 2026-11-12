@@ -39,4 +39,4 @@ journalctl --user -u tts-gateway -f
 - **モデルの取得**: `https` で `TTS_MODEL_HOSTS` のホストだけ（リダイレクト先も検査）、上限 `TTS_MODEL_MAX_MB`、sha256 の検査、エンジンでの読み込み検査を通ったものだけ使います。
 - **TLS**: 終端しません。ネットワーク越しに使うときは VPN（Tailscale など）かリバースプロキシの内側に置いてください。
 - **リバースプロキシ**: プロキシの後ろに置くと接続元が常にプロキシになるので、`TTS_ALLOW_CIDRS` の判定は意味を持ちません。その場合はプロキシ側で接続元を制限し、トークンを必ず設定してください。プロキシが付ける `Host`（`tts.example.com` など）を `TTS_ALLOWED_HOSTS` に入れます。
-- **systemd の強化**: 例の unit は `NoNewPrivileges`・`PrivateTmp`・`ProtectSystem=strict`（書けるのは `~/.local/share/tts-gateway` と `~/.cache/tts-gateway` だけ）・`RestrictAddressFamilies`・`LockPersonality` を指定しています。`TTS_DATA_DIR` / `TTS_CACHE_DIR` を変えたら `ReadWritePaths` も合わせてください。
+- **systemd の強化**: 例の unit は `NoNewPrivileges`・`PrivateTmp`・`ProtectSystem=strict`（書けるのは `~/.local/share/tts-gateway` と `~/.cache/tts-gateway` だけ）・`RestrictAddressFamilies`・`LockPersonality` を指定しています。`TTS_DATA_DIR` / `TTS_CACHE_DIR` を変えたら `ReadWritePaths` も合わせてください。 なお `PrivateTmp` と `ProtectSystem` は、環境によっては --user の unit で効きません（非特権のユーザー名前空間が制限されている Ubuntu など）。効かなくても起動はします。

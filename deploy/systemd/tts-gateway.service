@@ -24,7 +24,7 @@ MemoryMax=800M
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-ReadWritePaths=%h/.local/share/tts-gateway %h/.cache/tts-gateway
+ReadWritePaths=-%h/.local/share/tts-gateway -%h/.cache/tts-gateway
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 LockPersonality=yes
 
