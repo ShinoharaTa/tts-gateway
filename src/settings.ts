@@ -1,8 +1,8 @@
 /**
- * 画面から変えられる設定（データディレクトリの settings.json）。書き込みは .tmp → rename で原子的に。
+ * 画面から変えられる設定（データディレクトリの settings.json）。書き込みは .tmp → fsync → rename で原子的に。
  * PUT /v1/admin/settings は部分更新（送ったキーだけ変える。defaultVoices は送ったエンジンの分だけ変える）。
  */
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { invalid, notFound } from './errors.ts';
 
@@ -24,12 +24,34 @@ export const DEFAULT_SETTINGS: Settings = {
   cacheTtlDays: 30,
 };
 
-/** path.tmp に書いてから rename する */
+/** path.tmp に書いて fsync してから rename し、親ディレクトリも fsync する（親の fsync の失敗は無視） */
 export const writeAtomic = async (path: string, body: string): Promise<void> => {
-  await mkdir(dirname(path), { recursive: true });
+  const dir = dirname(path);
+  await mkdir(dir, { recursive: true });
   const tmp = `${path}.${process.pid}.tmp`;
-  await writeFile(tmp, body);
-  await rename(tmp, path);
+  try {
+    const fh = await open(tmp, 'w');
+    try {
+      await fh.writeFile(body);
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+    await rename(tmp, path);
+  } catch (e) {
+    await rm(tmp, { force: true });
+    throw e;
+  }
+  try {
+    const dh = await open(dir, 'r');
+    try {
+      await dh.sync();
+    } finally {
+      await dh.close();
+    }
+  } catch {
+    // ディレクトリの fsync ができない環境もある
+  }
 };
 
 const isInt = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v);

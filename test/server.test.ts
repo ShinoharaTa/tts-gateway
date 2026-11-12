@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { createServer, request, type Server } from 'node:http';
 import { chmod, rm, writeFile } from 'node:fs/promises';
 import { connect, type AddressInfo } from 'node:net';
@@ -26,6 +27,7 @@ const start = async (env: Record<string, string> = {}): Promise<Ctx> => {
     },
     isHostAllowed: h => h === '127.0.0.1',
     protocols: ['http:'],
+    isPortAllowed: () => true,
   });
   await app.registry.add(installedModel('zen-tts', 'marine'));
   server.on('request', createHandler(app));
@@ -289,6 +291,100 @@ test('models: 追加（URL）→ 取得 → installed、409、削除', async () 
     assert.equal((await fetch(`${c.base}/v1/admin/models/zen-tts/marine`, { method: 'DELETE' })).status, 409);
     assert.equal((await fetch(`${c.base}/v1/admin/models/zen-tts/mine`, { method: 'DELETE' })).status, 204);
     assert.equal((await fetch(`${c.base}/v1/admin/models/zen-tts/mine`, { method: 'DELETE' })).status, 404);
+  } finally {
+    await c.stop();
+    await new Promise<void>(r => origin.close(() => r()));
+  }
+});
+
+test('models: 同時ダウンロードの上限（429）・登録数の上限（400）・重なった取り直し（409）', async () => {
+  // /stall は一部だけ送って止まる。/file は全部返す
+  const origin: Server = createServer((req, res) => {
+    res.writeHead(200, { 'Content-Length': '3000' });
+    if (req.url === '/file') res.end(Buffer.alloc(3000, 1));
+    else res.write(Buffer.alloc(10, 1));
+  });
+  await new Promise<void>(r => origin.listen(0, '127.0.0.1', r));
+  const o = `http://127.0.0.1:${(origin.address() as AddressInfo).port}`;
+  const c = await start();
+  try {
+    const post = (body: unknown) => fetch(`${c.base}/v1/admin/models`, json(body));
+    assert.equal((await post({ engine: 'zen-tts', id: 's1', url: `${o}/stall` })).status, 202);
+    assert.equal((await post({ engine: 'zen-tts', id: 's2', url: `${o}/stall` })).status, 202);
+    const r = await post({ engine: 'zen-tts', id: 's3', url: `${o}/stall` });
+    assert.equal(r.status, 429);
+    assert.equal(r.headers.get('retry-after'), '5');
+    assert.equal(c.app.registry.get('zen-tts', 's3'), undefined);
+    // 取り直しも上限に数える
+    await c.app.registry.add({ ...installedModel('zen-tts', 'e1'), status: 'error' });
+    assert.equal((await fetch(`${c.base}/v1/admin/models/zen-tts/e1/download`, { method: 'POST' })).status, 429);
+    // 取得中のものを消すと止まり、.part も残らない
+    for (const id of ['s1', 's2']) assert.equal((await fetch(`${c.base}/v1/admin/models/zen-tts/${id}`, { method: 'DELETE' })).status, 204);
+    assert.equal(c.app.downloader.isActive('zen-tts', 's1'), false);
+    assert.equal(c.app.registry.get('zen-tts', 's1'), undefined);
+    assert.equal(existsSync(`${c.app.registry.modelPath('zen-tts', 's1', '.fake')}.part`), false);
+
+    // 同じ id の取り直しが重なったら 2 つ目は 409
+    await c.app.registry.update('zen-tts', 'e1', { source: { url: `${o}/stall`, sha256: null } });
+    const both = await Promise.all([1, 2].map(() => fetch(`${c.base}/v1/admin/models/zen-tts/e1/download`, { method: 'POST' })));
+    assert.deepEqual(both.map(x => x.status).sort(), [202, 409]);
+    const loser = both.find(x => x.status === 409)!;
+    assert.equal(await errorCode(loser), 'conflict');
+    assert.equal((await fetch(`${c.base}/v1/admin/models/zen-tts/e1`, { method: 'DELETE' })).status, 204);
+
+    // 登録は合計 50 件まで（marine を含む）
+    for (let i = c.app.registry.list().length; i < 50; i++) await c.app.registry.add(installedModel('zen-tts', `x${i}`));
+    const full = await post({ engine: 'zen-tts', id: 'over', url: `${o}/file` });
+    assert.equal(full.status, 400);
+    assert.match(((await full.json()) as { error: { message: string } }).error.message, /50/);
+  } finally {
+    origin.closeAllConnections();
+    await c.stop();
+    await new Promise<void>(r => origin.close(() => r()));
+  }
+});
+
+test('models: 削除の処理中（取得の終わりを待っている間）の同じ id の追加・取り直しは 409', async () => {
+  const file = Buffer.alloc(3000, 1);
+  const origin: Server = createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Length': String(file.length) });
+    res.end(file);
+  });
+  await new Promise<void>(r => origin.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${(origin.address() as AddressInfo).port}/m.fake`;
+  const c = await start();
+  try {
+    // 検査（verifying）で止めておく。削除は取得の終わりを待つので、その間が「削除の処理中」
+    let release!: () => void;
+    const gate = new Promise<void>(r => (release = r));
+    let verifying!: () => void;
+    const reached = new Promise<void>(r => (verifying = r));
+    c.engine.verifyModel = async () => {
+      verifying();
+      await gate;
+      return { voiceId: 'fake' };
+    };
+    assert.equal((await fetch(`${c.base}/v1/admin/models`, json({ engine: 'zen-tts', id: 'mine', url }))).status, 202);
+    await reached;
+    const del = fetch(`${c.base}/v1/admin/models/zen-tts/mine`, { method: 'DELETE' });
+    while (!c.app.downloader.isDeleting('zen-tts', 'mine')) await new Promise(r => setTimeout(r, 5));
+    const again = await fetch(`${c.base}/v1/admin/models/zen-tts/mine/download`, { method: 'POST' });
+    assert.equal(again.status, 409);
+    assert.match(((await again.json()) as { error: { message: string } }).error.message, /being deleted/);
+    const add = await fetch(`${c.base}/v1/admin/models`, json({ engine: 'zen-tts', id: 'mine', url }));
+    assert.equal(add.status, 409);
+    assert.match(((await add.json()) as { error: { message: string } }).error.message, /being deleted/);
+    release();
+    assert.equal((await del).status, 204);
+    assert.equal(c.app.registry.get('zen-tts', 'mine'), undefined);
+    const path = c.app.registry.modelPath('zen-tts', 'mine', '.fake');
+    assert.equal(existsSync(path), false);
+    assert.equal(existsSync(`${path}.part`), false);
+    // 削除が終われば同じ id で追加できる
+    c.engine.verifyModel = async () => ({ voiceId: 'fake' });
+    assert.equal((await fetch(`${c.base}/v1/admin/models`, json({ engine: 'zen-tts', id: 'mine', url }))).status, 202);
+    await c.app.downloader.wait('zen-tts', 'mine');
+    assert.equal(c.app.registry.get('zen-tts', 'mine')!.status, 'installed');
   } finally {
     await c.stop();
     await new Promise<void>(r => origin.close(() => r()));

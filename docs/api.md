@@ -27,13 +27,13 @@
 | 403 | `forbidden_origin` | `Origin` が許可外・`null`（`GET` / `HEAD` / `OPTIONS` 以外） |
 | 404 | `not_found` | エンジン・声・モデル・パスが無い |
 | 405 | `method_not_allowed` | パスはあるがメソッドが違う。`Allow` ヘッダ付き |
-| 409 | `conflict` | 同じ id のモデルがある・ダウンロード中 など |
+| 409 | `conflict` | 同じ id のモデルがある・ダウンロード中（取得の要求が重なった）・削除の処理中 など |
 | 413 | `text_too_long` | `text` が上限（既定 2,000 字）を超えた |
 | 415 | `unsupported_media_type` | JSON 以外の本文（JSON を受ける `POST` / `PUT` は本文が空でも） |
 | 421 | `misdirected_request` | `Host` ヘッダが許可外・無い |
 | 422 | `model_not_installed` | 声は登録済みだが重みが未取得 |
 | 422 | `unprocessable_text` | 読み上げられない長さの語が含まれる（1 回の合成の上限を超える文を割り直しても収まらない） |
-| 429 | `queue_full` | 待ち行列が満杯。`Retry-After` ヘッダ（秒）付き |
+| 429 | `queue_full` | 待ち行列が満杯・同時ダウンロードが上限（2 件）。`Retry-After` ヘッダ（秒）付き |
 | 500 | `internal_error` | 想定外の失敗 |
 | 503 | `engine_unavailable` | モデル読み込み・合成プロセスの失敗。ffmpeg が無い（起動できない）ときに ffmpeg の要る要求（`wav` 以外、またはリサンプルの要る `wav`）。ffmpeg が 30 秒で終わらない（`timed out`）。待ち行列での待ちが `TTS_TIMEOUT_SEC` を超えた（`Retry-After` ヘッダ付き） |
 | 504 | `timeout` | 合成が時間内（既定 60 秒）に終わらなかった |
@@ -268,18 +268,22 @@ curl -sS -X POST http://127.0.0.1:8710/v1/synthesize \
 ```
 
 - `catalog: "kikka"` だけを送るとカタログの値で登録する（`{ "engine": "zen-tts", "catalog": "kikka" }`）。
-- `id`: `^[a-z0-9][a-z0-9_-]{0,31}$`。同じエンジンに同じ id があれば 409。
-- `url`: `https://` のみ。ホストは `TTS_MODEL_HOSTS`（既定 `tts-models.zenryoku.work,huggingface.co,hf.co`）のどれか、またはそのサブドメインであること。リダイレクト先も同じ規則で検査する。上限 `TTS_MODEL_MAX_MB`（既定 512MB）。
+- `id`: `^[a-z0-9][a-z0-9_-]{0,31}$`。同じエンジンに同じ id があれば 409（その id を削除の処理中も 409）。
+- `url`: `https://` のみ、ポートは 443 のみ（省略か明示の `:443`。ほかは 400）。ホストは `TTS_MODEL_HOSTS`（既定 `tts-models.zenryoku.work,huggingface.co,hf.co`）のどれか、またはそのサブドメインであること。リダイレクト先も同じ規則（ホスト・ポート）で検査する。リダイレクトは最大 5 回。上限 `TTS_MODEL_MAX_MB`（既定 512MB）。
+- 時間の上限: 1 件の取得の全体で `TTS_MODEL_TIMEOUT_SEC`（既定 600 秒）、無通信が 30 秒。超えたら `error` にして途中のファイルを消す。
+- 書き込みに失敗したとき（ディスクの空き不足・権限など）も `error` にして途中のファイルを消す。
+- 登録は全エンジンの合計 50 件まで（超える追加は 400）。
+- 同時ダウンロードは 2 件まで。超えたら 429（`Retry-After: 5`）で、登録しない。
 - `sha256`: 任意。指定したら一致しないと `error`。省略したら取得したファイルの値を記録する（以後の再取得はその値で検査する）。
 - 取得後、エンジンで読み込めるか検査する（ZEN-TTS: `.ztm` のヘッダと読み込み）。失敗なら `error` にしてファイルを消す。
 
 ### POST /v1/admin/models/{engine}/{id}/download
 
-`pending` / `error` のモデルを取り直す。`202`。
+`pending` / `error` のモデルを取り直す。`202`。同じ id の取得が重なったら 2 つ目は 409、削除の処理中も 409。同時ダウンロードが 2 件なら 429（`Retry-After: 5`）。
 
 ### DELETE /v1/admin/models/{engine}/{id}
 
-登録と重みのファイルを消す。既定の声に設定されているものは 409。ダウンロード中なら中止して消す。`204`。
+登録と重みのファイルを消す。既定の声に設定されているものは 409。ダウンロード中なら中止し、途中のファイル（`.part`）が消えるのを待ってから消す。その間に来た同じ id の追加・取り直しは 409。`204`。
 
 ### PUT /v1/admin/dictionary/{surface} / DELETE /v1/admin/dictionary/{surface}
 

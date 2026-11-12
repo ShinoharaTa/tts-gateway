@@ -333,6 +333,9 @@ paths:
       operationId: addModel
       tags: [admin]
       summary: モデルを登録し、ダウンロードを始める（非同期）
+      description: |
+        登録は全エンジンの合計 50 件まで（超える追加は 400）。同時ダウンロードは 2 件まで（超えたら 429、登録しない）。
+        同じ id のモデルがある・その id を削除の処理中なら 409。
       requestBody:
         required: true
         content:
@@ -360,11 +363,14 @@ paths:
           $ref: '#/components/responses/UnsupportedMediaType'
         '421':
           $ref: '#/components/responses/MisdirectedRequest'
+        '429':
+          $ref: '#/components/responses/TooManyDownloads'
   /v1/admin/models/{engine}/{id}/download:
     post:
       operationId: redownloadModel
       tags: [admin]
       summary: pending / error のモデルを取り直す
+      description: 同じ id の取得が重なった・削除の処理中なら 409。同時ダウンロードが 2 件なら 429。
       parameters:
         - $ref: '#/components/parameters/Engine'
         - $ref: '#/components/parameters/ModelId'
@@ -387,11 +393,14 @@ paths:
           $ref: '#/components/responses/UnsupportedMediaType'
         '421':
           $ref: '#/components/responses/MisdirectedRequest'
+        '429':
+          $ref: '#/components/responses/TooManyDownloads'
   /v1/admin/models/{engine}/{id}:
     delete:
       operationId: deleteModel
       tags: [admin]
       summary: 登録と重みのファイルを消す（ダウンロード中なら中止して消す）
+      description: ダウンロード中なら中止し、途中のファイル（.part）が消えるのを待ってから消す。その間の同じ id の追加・取り直しは 409。
       parameters:
         - $ref: '#/components/parameters/Engine'
         - $ref: '#/components/parameters/ModelId'
@@ -536,7 +545,7 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
     Conflict:
-      description: 同じ id のモデルがある・ダウンロード中・既定の声 など
+      description: 同じ id のモデルがある・ダウンロード中（取得の要求が重なった）・削除の処理中・既定の声 など
       content:
         application/json:
           schema:
@@ -581,6 +590,18 @@ components:
       headers:
         Retry-After:
           description: 再試行までの秒数
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    TooManyDownloads:
+      description: 同時ダウンロードが上限（2 件）。code は queue_full
+      headers:
+        Retry-After:
+          description: 再試行までの秒数（5）
           schema:
             type: integer
             minimum: 1
@@ -1333,7 +1354,7 @@ components:
           type: string
           format: uri
           pattern: '^https://'
-          description: ホストは TTS_MODEL_HOSTS のどれか、またはそのサブドメイン（リダイレクト先も同じ）
+          description: ポートは 443 のみ（省略か明示の 443）。ホストは TTS_MODEL_HOSTS のどれか、またはそのサブドメイン（リダイレクト先も同じ。リダイレクトは最大 5 回）
         sha256:
           type: string
           pattern: '^[0-9a-fA-F]{64}$'
