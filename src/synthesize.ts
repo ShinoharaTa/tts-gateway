@@ -13,7 +13,7 @@ import type { SynthQueue } from './queue.ts';
 import type { SettingsStore } from './settings.ts';
 import type { Dictionary, Hit, UnknownWord } from './text/readings.ts';
 import { afterReadings, beforeReadings } from './text/spoken.ts';
-import { validateSynthRequest, type SynthRequest } from './validate.ts';
+import { charCount, validateSynthRequest, type SynthRequest } from './validate.ts';
 
 // ---- 文分割 ----
 
@@ -21,6 +21,8 @@ const SENTENCE_END_RE = /[。！？!?]/;
 const SOFT_BREAK_RE = /[、，, 　]/;
 /** 読める文字（文字か数字）を含むか */
 const SPEAKABLE_RE = /[\p{L}\p{N}]/u;
+/** String.prototype.trim が落とす文字（\s と同じ集合） */
+const SPACE_RE = /^\s$/;
 
 /**
  * 文に分ける。「。！？!?」の後（記号は前の文に付ける）と改行で切り、maxChars を超える文は
@@ -28,23 +30,28 @@ const SPEAKABLE_RE = /[\p{L}\p{N}]/u;
  */
 export const splitSentences = (text: string, maxChars: number): string[] => {
   const out: string[] = [];
-  const push = (s: string): void => {
-    let rest = s.trim();
-    while ([...rest].length > maxChars) {
-      const chars = [...rest];
+  const emit = (chars: readonly string[], from: number, to: number): void => {
+    const s = chars.slice(from, to).join('').trim();
+    if (s && SPEAKABLE_RE.test(s)) out.push(s);
+  };
+  // chars[from, to) を 1 文として出す。文字列を作り直さず位置だけ進める（長い文でも線形時間）。前後の空白は trim と同じく落とす
+  const push = (chars: readonly string[], from: number, to: number): void => {
+    while (from < to && SPACE_RE.test(chars[from]!)) from++;
+    while (to > from && SPACE_RE.test(chars[to - 1]!)) to--;
+    while (to - from > maxChars) {
       let cut = -1;
       for (let i = maxChars - 1; i > 0; i--) {
-        if (SOFT_BREAK_RE.test(chars[i]!)) {
+        if (SOFT_BREAK_RE.test(chars[from + i]!)) {
           cut = i + 1;
           break;
         }
       }
       if (cut <= 0) cut = maxChars;
-      const head = chars.slice(0, cut).join('').trim();
-      if (head && SPEAKABLE_RE.test(head)) out.push(head);
-      rest = chars.slice(cut).join('').trim();
+      emit(chars, from, from + cut);
+      from += cut;
+      while (from < to && SPACE_RE.test(chars[from]!)) from++;
     }
-    if (rest && SPEAKABLE_RE.test(rest)) out.push(rest);
+    emit(chars, from, to);
   };
   for (const line of text.split(/\r?\n/)) {
     let start = 0;
@@ -52,11 +59,11 @@ export const splitSentences = (text: string, maxChars: number): string[] => {
     for (let i = 0; i < chars.length; i++) {
       // 「！？」の連なり（？！ など）は 1 つの文末として扱う
       if (SENTENCE_END_RE.test(chars[i]!) && !SENTENCE_END_RE.test(chars[i + 1] ?? '')) {
-        push(chars.slice(start, i + 1).join(''));
+        push(chars, start, i + 1);
         start = i + 1;
       }
     }
-    push(chars.slice(start).join(''));
+    push(chars, start, chars.length);
   }
   return out;
 };
@@ -65,12 +72,23 @@ export const splitSentences = (text: string, maxChars: number): string[] => {
 
 export type Prepared = { spoken: string; sentences: string[]; hits: Hit[]; unknownWords: UnknownWord[] };
 
-export const prepareText = (req: Pick<SynthRequest, 'text' | 'preprocess' | 'dictionary' | 'readings' | 'maxSentenceChars'>, dict: Dictionary): Prepared => {
+/** 前処理と辞書を通した後の文は、text の上限（TTS_MAX_CHARS）のこの倍まで */
+export const SPOKEN_CHARS_FACTOR = 3;
+
+/** maxChars: text の上限（TTS_MAX_CHARS）。前処理と辞書の後の文が maxChars × SPOKEN_CHARS_FACTOR 字を超えたら 413 */
+export const prepareText = (
+  req: Pick<SynthRequest, 'text' | 'preprocess' | 'dictionary' | 'readings' | 'maxSentenceChars'>,
+  dict: Dictionary,
+  maxChars: number,
+): Prepared => {
   // 辞書は記号の規則より先に当てる（GPT-4o・COVID-19 を崩す前に）。normalize と synthesize は同じ順
   const pre = req.preprocess ? beforeReadings(req.text) : req.text.normalize('NFKC');
   const readings = dict.withRequest(req.readings);
   const replaced = req.dictionary ? readings.apply(pre) : pre;
   const spoken = req.preprocess ? afterReadings(replaced) : replaced;
+  const limit = maxChars * SPOKEN_CHARS_FACTOR;
+  if (charCount(spoken) > limit)
+    throw new ApiError(413, 'text_too_long', `text is longer than ${limit} characters after applying preprocessing and the reading dictionary`, 'text');
   return {
     spoken,
     sentences: splitSentences(spoken, req.maxSentenceChars),
@@ -196,7 +214,7 @@ export class Synthesizer {
   /** POST /v1/normalize */
   normalize(raw: unknown): Prepared & { text: string } {
     const req = this.validate(raw);
-    const p = prepareText(req, this.d.dictionary);
+    const p = prepareText(req, this.d.dictionary, this.d.maxChars);
     return { text: req.text, ...p };
   }
 
@@ -216,7 +234,7 @@ export class Synthesizer {
     const engine = this.d.engines.get(req.engine)!;
     const voice = this.resolveVoice(engine, req.voice);
     const limit = engine.sentenceCharLimit?.(req.options) ?? Infinity;
-    const { sentences } = prepareText({ ...req, maxSentenceChars: Math.min(req.maxSentenceChars, limit) }, this.d.dictionary);
+    const { sentences } = prepareText({ ...req, maxSentenceChars: Math.min(req.maxSentenceChars, limit) }, this.d.dictionary, this.d.maxChars);
     if (sentences.length === 0) throw invalid('text has nothing to read', 'text');
 
     const params: RenderParams = {

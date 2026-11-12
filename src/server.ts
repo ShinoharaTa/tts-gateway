@@ -1,7 +1,9 @@
 /**
  * HTTP サーバー（node:http）。ルーティング、接続元の許可リスト、認証、JSON の入出力、設定画面の静的ファイル。
  *
- * - 許可リスト外の接続元は全パスで 403。認証は TTS_TOKEN があれば /healthz と設定画面の静的ファイル以外で必須、
+ * - 許可リスト外の接続元は全パスで 403。Host が TTS_HOSTS:TTS_PORT・localhost:TTS_PORT・TTS_ALLOWED_HOSTS 以外なら 421、
+ *   GET / HEAD / OPTIONS 以外で Origin の host が同じ許可に入らなければ 403（DNS rebinding・CSRF 対策）
+ * - 認証は TTS_TOKEN があれば /healthz と設定画面の静的ファイル以外で必須（TTS_ADMIN_TOKEN でも通る）、
  *   /v1/admin/* は TTS_ADMIN_TOKEN があればその値（無ければ TTS_TOKEN の規則）
  * - 本文は application/json だけ（ほかは 415）。CORS ヘッダは返さない
  */
@@ -16,13 +18,13 @@ import type { Engine } from './engines/types.ts';
 import { ApiError, conflict, invalid, notFound } from './errors.ts';
 import { loadCatalog, type CatalogModel } from './models/catalog.ts';
 import { ModelDownloader } from './models/download.ts';
-import { MODEL_ID_RE, Registry, type ModelRecord } from './models/registry.ts';
-import { isAllowed } from './net.ts';
+import { MAX_MODELS, MODEL_ID_RE, Registry, type ModelRecord } from './models/registry.ts';
+import { isAllowed, parseIp } from './net.ts';
 import { SynthQueue } from './queue.ts';
 import { SettingsStore, validateSettingsPatch } from './settings.ts';
 import { Synthesizer } from './synthesize.ts';
-import { Dictionary, isReading } from './text/readings.ts';
-import { checkKeys, checkObject, checkString, checkSurface } from './validate.ts';
+import { Dictionary } from './text/readings.ts';
+import { checkKeys, checkObject, checkReading, checkString, checkSurface } from './validate.ts';
 
 export type App = {
   config: Config;
@@ -42,9 +44,10 @@ export type App = {
 export type AppOverrides = {
   /** テスト用: 偽のエンジン */
   engines?: (deps: EngineDeps) => Map<string, Engine>;
-  /** テスト用: モデル取得のホスト判定と許可するスキーム */
+  /** テスト用: モデル取得のホスト判定・許可するスキーム・ポート判定 */
   isHostAllowed?: (host: string) => boolean;
   protocols?: readonly string[];
+  isPortAllowed?: (port: number) => boolean;
 };
 
 export const createApp = async (config: Config, o: AppOverrides = {}): Promise<App> => {
@@ -65,8 +68,10 @@ export const createApp = async (config: Config, o: AppOverrides = {}): Promise<A
     engines,
     modelHosts: config.modelHosts,
     maxBytes: config.modelMaxBytes,
+    timeoutMs: config.modelTimeoutSec * 1000,
     isHostAllowed: o.isHostAllowed,
     protocols: o.protocols,
+    isPortAllowed: o.isPortAllowed,
   });
   const synth = new Synthesizer({
     engines, registry, settings, cache, queue, dictionary,
@@ -115,6 +120,7 @@ const sendError = (res: ServerResponse, e: ApiError): void => {
   const headers: Record<string, string> = {};
   if (e.retryAfterSec !== undefined) headers['Retry-After'] = String(e.retryAfterSec);
   if (e.status === 401) headers['WWW-Authenticate'] = 'Bearer';
+  if (e.allow !== undefined) headers.Allow = e.allow;
   sendJson(res, e.status, e.toJSON(), headers);
 };
 
@@ -162,10 +168,63 @@ const tokenMatches = (req: IncomingMessage, token: string): boolean => {
   return !!m && timingSafeEqual(digest(m[1]!.trim()), digest(token));
 };
 
+/** 管理ルートは TTS_ADMIN_TOKEN（無ければ TTS_TOKEN）。ほかは TTS_TOKEN があれば必須で、TTS_ADMIN_TOKEN でも通る */
 const requireAuth = (req: IncomingMessage, config: Config, admin: boolean): void => {
-  const token = admin && config.adminToken ? config.adminToken : config.token;
-  if (!token) return;
-  if (!tokenMatches(req, token)) throw new ApiError(401, 'unauthorized', 'missing or invalid bearer token');
+  let ok: boolean;
+  if (admin) {
+    const token = config.adminToken || config.token;
+    if (!token) return;
+    ok = tokenMatches(req, token);
+  } else {
+    if (!config.token) return;
+    const user = tokenMatches(req, config.token);
+    const adminOk = !!config.adminToken && tokenMatches(req, config.adminToken);
+    ok = user || adminOk;
+  }
+  if (!ok) throw new ApiError(401, 'unauthorized', 'missing or invalid bearer token');
+};
+
+// ---- Host / Origin ----
+
+/** Host ヘッダ（Origin の host 部分）の判定。TTS_HOSTS の各アドレス:ポート、ループバックなら localhost:ポート、TTS_ALLOWED_HOSTS（ポートは問わない） */
+const hostMatcher = (config: Config): ((host: string | undefined) => boolean) => {
+  const exact = new Set<string>();
+  const add = (name: string): void => {
+    exact.add(`${name}:${config.port}`);
+    if (config.port === 80) exact.add(name);
+  };
+  for (const h of config.hosts) {
+    const lower = h.toLowerCase();
+    if (lower.includes(':')) {
+      add(`[${lower}]`);
+      // URL が正規化した形（[0:0::1] → [::1]）も許す
+      try {
+        add(new URL(`http://[${lower}]/`).hostname);
+      } catch {}
+    } else add(lower);
+    const ip = parseIp(h);
+    const local = !!ip && (ip.family === 4 ? ip.bytes.join('.') === '127.0.0.1' : ip.bytes.subarray(0, 15).every(x => x === 0) && ip.bytes[15] === 1);
+    if (local) add('localhost');
+  }
+  const names = new Set(config.allowedHosts);
+  return host => {
+    if (!host) return false;
+    const h = host.toLowerCase();
+    if (exact.has(h)) return true;
+    const m = /^([^:[\]]+)(?::\d+)?$/.exec(h);
+    return !!m && names.has(m[1]!);
+  };
+};
+
+/** Origin を見ないメソッド（ブラウザが他サイトから本文付きで送れない） */
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+const checkOrigin = (origin: string, hostOk: (host: string) => boolean): void => {
+  let host = '';
+  try {
+    host = new URL(origin).host;
+  } catch {}
+  if (!host || !hostOk(host)) throw new ApiError(403, 'forbidden_origin', 'request origin is not allowed');
 };
 
 // ---- 静的ファイル（設定画面） ----
@@ -267,9 +326,18 @@ const addModel = async (app: App, raw: unknown): Promise<ModelRecord> => {
     };
   }
   app.downloader.validateUrl(rec.source.url, body.catalog !== undefined ? 'catalog' : 'url');
+  if (app.registry.list().length >= MAX_MODELS) throw invalid(`too many models (up to ${MAX_MODELS})`);
+  if (app.downloader.isDeleting(engineId, rec.id)) throw conflict(`model ${rec.id} of ${engineId} is being deleted`, 'id');
   if (app.registry.get(engineId, rec.id)) throw conflict(`model ${rec.id} of ${engineId} already exists`, 'id');
+  app.downloader.checkCapacity();
   await app.registry.add(rec);
-  await app.downloader.start(rec);
+  try {
+    await app.downloader.start(rec);
+  } catch (e) {
+    // 始められなければ（同時取得の上限など）登録しない
+    await app.registry.remove(engineId, rec.id);
+    throw e;
+  }
   return rec;
 };
 
@@ -278,11 +346,13 @@ const deleteModel = async (app: App, engineId: string, id: string): Promise<void
   const rec = app.registry.get(engineId, id);
   if (!engine || !rec) throw notFound(`model ${id} of ${engineId} not found`);
   if (app.settings.get().defaultVoices[engineId] === id) throw conflict(`model ${id} is the default voice of ${engineId}`);
-  await app.downloader.cancel(engineId, id);
-  const path = app.registry.modelPath(engineId, id, engine.modelExt);
-  await rm(path, { force: true });
-  await rm(`${path}.part`, { force: true });
-  await app.registry.remove(engineId, id);
+  // 取得中なら止めて .part が消えるのを待ってから消す。その間の同じ id の追加・取り直しは 409
+  await app.downloader.remove(engineId, id, async () => {
+    const path = app.registry.modelPath(engineId, id, engine.modelExt);
+    await rm(path, { force: true });
+    await rm(`${path}.part`, { force: true });
+    await app.registry.remove(engineId, id);
+  });
 };
 
 const decodeSegment = (s: string): string => {
@@ -298,8 +368,7 @@ const putReading = async (app: App, rawSurface: string, raw: unknown): Promise<v
   const body = checkObject(raw, '');
   checkKeys(body, ['reading']);
   if (body.reading === undefined) throw invalid('reading is required', 'reading');
-  const reading = checkString(body.reading, 'reading').trim();
-  if (!isReading(reading)) throw invalid('reading must be katakana (with ー・ and spaces)', 'reading');
+  const reading = checkReading(checkString(body.reading, 'reading'), 'reading');
   await app.dictionary.set(surface, reading);
 };
 
@@ -307,14 +376,15 @@ const putReading = async (app: App, rawSurface: string, raw: unknown): Promise<v
 
 type Route = { method: string; re: RegExp; admin: boolean; auth: boolean; run: (app: App, req: IncomingMessage, res: ServerResponse, m: string[]) => Promise<void> };
 
+const healthz: Route['run'] = async (_app, req, res) => {
+  await noBody(req);
+  // HEAD では node:http が本文を送らない
+  sendJson(res, 200, { status: 'ok', version: VERSION });
+};
+
 const routes: Route[] = [
-  {
-    method: 'GET', re: /^\/healthz$/, admin: false, auth: false,
-    run: async (_app, req, res) => {
-      await noBody(req);
-      sendJson(res, 200, { status: 'ok', version: VERSION });
-    },
-  },
+  { method: 'GET', re: /^\/healthz$/, admin: false, auth: false, run: healthz },
+  { method: 'HEAD', re: /^\/healthz$/, admin: false, auth: false, run: healthz },
   {
     method: 'GET', re: /^\/v1\/engines$/, admin: false, auth: true,
     run: async (app, req, res) => {
@@ -407,6 +477,7 @@ const routes: Route[] = [
       const [engineId, id] = [decodeSegment(m[1]!), decodeSegment(m[2]!)];
       const rec = app.registry.get(engineId, id);
       if (!rec) throw notFound(`model ${id} of ${engineId} not found`);
+      if (app.downloader.isDeleting(engineId, id)) throw conflict(`model ${id} is being deleted`);
       if (rec.status !== 'pending' && rec.status !== 'error') throw conflict(`model ${id} is ${rec.status}`);
       await app.downloader.start(rec);
       sendJson(res, 202, rec);
@@ -447,41 +518,62 @@ const routes: Route[] = [
   },
 ];
 
-export const createHandler = (app: App): RequestListener => async (req, res) => {
-  try {
-    if (!isAllowed(req.socket.remoteAddress, app.config.allowCidrs)) throw new ApiError(403, 'forbidden', 'client address is not allowed');
-    const path = new URL(req.url ?? '/', 'http://localhost').pathname;
-    const method = req.method ?? 'GET';
+const methodNotAllowed = (method: string, path: string, allow: string): ApiError => {
+  const e = new ApiError(405, 'method_not_allowed', `${method} is not allowed for ${path}`);
+  e.allow = allow;
+  return e;
+};
 
-    if ((method === 'GET' || method === 'HEAD') && path === '/admin') {
-      res.writeHead(301, { ...SECURITY_HEADERS, Location: '/admin/' });
-      res.end();
-      return;
+export const createHandler = (app: App): RequestListener => {
+  const hostOk = hostMatcher(app.config);
+  return async (req, res) => {
+    try {
+      if (!isAllowed(req.socket.remoteAddress, app.config.allowCidrs)) throw new ApiError(403, 'forbidden', 'client address is not allowed');
+      if (!hostOk(req.headers.host)) throw new ApiError(421, 'misdirected_request', 'Host header is not one of the addresses this server answers for');
+      const method = req.method ?? 'GET';
+      if (req.headers.origin !== undefined && !SAFE_METHODS.has(method)) checkOrigin(req.headers.origin, hostOk);
+      let path: string;
+      try {
+        path = new URL(req.url ?? '/', 'http://localhost').pathname;
+      } catch {
+        throw new ApiError(400, 'bad_request', 'invalid request target');
+      }
+
+      if (path === '/admin' || STATIC[path]) {
+        if (method !== 'GET' && method !== 'HEAD') throw methodNotAllowed(method, path, 'GET, HEAD');
+        if (path === '/admin') {
+          res.writeHead(301, { ...SECURITY_HEADERS, Location: '/admin/' });
+          res.end();
+        } else await serveStatic(res, app.config, path, method === 'HEAD');
+        return;
+      }
+      const matched = routes.filter(r => r.re.test(path));
+      const r = matched.find(x => x.method === method);
+      if (r) {
+        if (r.auth) requireAuth(req, app.config, r.admin);
+        await r.run(app, req, res, r.re.exec(path)!);
+        return;
+      }
+      if (matched.length > 0) {
+        // 同じパスのルートは認証の要否が同じ
+        if (matched[0]!.auth) requireAuth(req, app.config, matched[0]!.admin);
+        throw methodNotAllowed(method, path, matched.map(x => x.method).join(', '));
+      }
+      // 未定義のパスも、トークンが要る構成なら先に 401（どのパスがあるかを未認証で探らせない）
+      requireAuth(req, app.config, path.startsWith('/v1/admin/'));
+      throw notFound(`${method} ${path} not found`);
+    } catch (e) {
+      if (res.headersSent) {
+        res.destroy();
+        return;
+      }
+      if (e instanceof ApiError) {
+        if (e.status >= 500) console.error(`${req.method} ${req.url}: ${e.status} ${e.code} ${e.message}`);
+        sendError(res, e);
+      } else {
+        console.error(`${req.method} ${req.url}: ${(e as Error)?.stack ?? e}`);
+        sendError(res, new ApiError(500, 'internal_error', 'internal error'));
+      }
     }
-    if ((method === 'GET' || method === 'HEAD') && STATIC[path]) {
-      await serveStatic(res, app.config, path, method === 'HEAD');
-      return;
-    }
-    for (const r of routes) {
-      if (r.method !== method) continue;
-      const m = r.re.exec(path);
-      if (!m) continue;
-      if (r.auth) requireAuth(req, app.config, r.admin);
-      await r.run(app, req, res, m);
-      return;
-    }
-    throw notFound(`${method} ${path} not found`);
-  } catch (e) {
-    if (res.headersSent) {
-      res.destroy();
-      return;
-    }
-    if (e instanceof ApiError) {
-      if (e.status >= 500) console.error(`${req.method} ${req.url}: ${e.status} ${e.code} ${e.message}`);
-      sendError(res, e);
-    } else {
-      console.error(`${req.method} ${req.url}: ${(e as Error)?.stack ?? e}`);
-      sendError(res, new ApiError(500, 'internal_error', 'internal error'));
-    }
-  }
+  };
 };

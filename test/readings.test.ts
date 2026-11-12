@@ -4,7 +4,8 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { PACKAGE_DIR } from '../src/config.ts';
-import { compileReadings, Dictionary, isAcronym, isReading, parseReadingsTsv, type ReadingRow } from '../src/text/readings.ts';
+import { compileReadings, Dictionary, DOMAIN_RE, isAcronym, isReading, parseReadingsTsv, type ReadingRow, type Readings } from '../src/text/readings.ts';
+import { EMAIL_RE, URL_RE } from '../src/text/spoken.ts';
 import { tempDir } from './helpers.ts';
 
 const rows = (pairs: [string, string][], source: ReadingRow['source'] = 'builtin'): ReadingRow[] =>
@@ -157,4 +158,157 @@ test('辞書の version は読みが同じなら同じ', () => {
   assert.equal(a.version, b.version);
   const c = compileReadings(rows([['Bee', 'ビイ']]));
   assert.notEqual(a.version, c.version);
+});
+
+test('要求ごとの readings 200 語 × 本文 2,000 字が 200ms 以内', () => {
+  const builtin = parseReadingsTsv(readFileSync(join(PACKAGE_DIR, 'dict', 'readings.tsv'), 'utf8'));
+  const dict = new Dictionary(builtin, [], '/nonexistent/readings.tsv');
+  const tag = (i: number): string => String.fromCharCode(97 + (i % 26)) + String.fromCharCode(97 + Math.floor(i / 26));
+  // 変更前は数秒かかった形: 100 字の surface が本文の語の並びと途中まで一致する
+  const spaced = Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`${'a '.repeat(48)}${tag(i)}`, 'ア']));
+  const plain = Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`word${tag(i)}`, 'ワード']));
+  const plainText = Object.keys(plain).map(w => `${w} を GitHub に push した。`).join('').slice(0, 2000);
+  for (const [readings, text] of [[spaced, 'a '.repeat(1000)], [plain, plainText]] as const) {
+    const started = performance.now();
+    const r = dict.withRequest(readings);
+    r.apply(text);
+    r.hits([text]);
+    r.unknownWords([text]);
+    const ms = performance.now() - started;
+    assert.ok(ms < 200, `${ms.toFixed(0)}ms`);
+  }
+});
+
+// ---- 照合の結果を、正規表現 1 本で照合していた実装（変更前）と比べる ----
+
+/**
+ * 変更前の照合（URL・メール・ドットを含む surface・ドメイン・ほかの surface を 1 本の正規表現で当てる。
+ * 全部大文字の語も置き換え、語の間の空白は改行をまたがない）。r.entries() の語で作る
+ */
+const legacyReplace = (r: Readings, text: string): { out: string; hits: string[] } => {
+  const entries = r.entries();
+  const chosen = new Map(entries.map(e => [e.surface.toLowerCase(), e.reading]));
+  const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const surfacePattern = (surface: string): string => {
+    const body = surface.split(' ').map(escapeRe).join('[ \\t\\u3000]+');
+    const head = /[A-Za-z0-9]/.test(surface[0]!) ? '(?<![A-Za-z0-9])' : '';
+    const last = surface.at(-1)!;
+    const tail = /[A-Za-z]/.test(last) ? '(?![A-Za-z])' : /\d/.test(last) ? '(?![A-Za-z0-9])' : '';
+    return `${head}${body}${tail}`;
+  };
+  const byLength = entries.map(e => e.surface).sort((a, b) => b.length - a.length);
+  const nfkc = text.normalize('NFKC');
+  const hits: string[] = [];
+  if (!byLength.length) return { out: nfkc, hits };
+  const dotted = byLength.filter(s => s.includes('.'));
+  const plain = byLength.filter(s => !s.includes('.'));
+  const group = (list: string[]): string => (list.length ? list.map(surfacePattern).join('|') : '(?!)');
+  const dottedGroup = dotted.length ? `(?<![.@])(?:${group(dotted)})(?!\\.[A-Za-z0-9])` : '(?!)';
+  const re = new RegExp(
+    `(${URL_RE.source})|(${EMAIL_RE.source})|(${dottedGroup})|(${DOMAIN_RE.source})|(${group(plain)})` +
+      `(?:(['’]s(?![A-Za-z]))|(-(?=[A-Za-z0-9])))?`,
+    'giu',
+  );
+  const out = nfkc.replace(
+    re,
+    (m: string, url?: string, email?: string, dottedWord?: string, domain?: string, plainWord?: string, _p?: string, hyphen?: string) => {
+      const word = dottedWord || plainWord;
+      if (url || email || domain || !word) return m;
+      const key = word.replace(/[ \t\u3000]+/g, ' ').toLowerCase();
+      const reading = chosen.get(key);
+      if (!reading) return m;
+      hits.push(key);
+      return hyphen ? `${reading} ` : reading;
+    },
+  );
+  return { out, hits };
+};
+
+/** 決まった種から作る乱数（テストを毎回同じにする） */
+const prng = (seed: number): (() => number) => () => {
+  seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+  return seed / 0x80000000;
+};
+
+const assertSameAsLegacy = (r: Readings, text: string, label: string): void => {
+  const want = legacyReplace(r, text);
+  assert.equal(r.apply(text), want.out, label);
+  assert.deepEqual(r.hits([text]).map(h => h.surface), [...new Set(want.hits)], label);
+};
+
+test('照合の結果が変更前の実装と同じ（固定の例）', () => {
+  const r = compileReadings(rows([
+    ['GitHub', 'ギットハブ'], ['push', 'プッシュ'], ['MacBook', 'マックブック'], ['MacBook Pro', 'マックブックプロ'],
+    ['Mac', 'マック'], ['iPhone', 'アイフォーン'], ['Apple', 'アップル'], ['Pixel', 'ピクセル'], ['example', 'エグザンプル'],
+    ['Next.js', 'ネクストジェイエス'], ['C++', 'シープラスプラス'], ['A1', 'エーワン'], ['Ver2', 'バーツー'], ['Pokémon', 'ポケモン'],
+    ['Σίσυφος', 'シシュフォス'], ['ς', 'シグマ'], ['café', 'カフェ'], ['Foo', 'フー'], ['Foo Bar', 'フーバー'], ['日本語', 'ニホンゴ'],
+    ['.NET', 'ドットネット'], ['Mac-mini', 'マックミニ'], ['GPU', 'ジーピーユー'], ['Max', 'マックス'],
+    ['Character.AI', 'キャラクターエーアイ'], ['Character', 'キャラクター'], ['Booking.com', 'ブッキングドットコム'], ['NASA', 'ナサ'],
+    ['API', 'エーピーアイ'], ['PS5', 'ピーエスファイブ'], ['Hugging Face', 'ハギングフェイス'],
+  ]));
+  const texts = [
+    'GitHub に push、macbook pro と MACBOOK と Mac-mini',
+    "Apple's Pixel-9 と Pixel-a と iPhone16 と xiPhone と 2Mac",
+    'https://github.com/example と github.com/foo と me@example.com と example.com-x',
+    'Next.js と C++ と c++17 と A1x と a1 と VER2 と ver23',
+    'POKÉMON と pokémon と ΣΊΣΥΦΟΣ と σίσυφοσ と Σ と σ と CAFÉ',
+    'foo  bar と foo　bar と foo\tbar と Foo\nBar と foobar',
+    '日本語と.NET と .net と ASP.NET と MAX と Max と GPU',
+    "HTTPS://GITHUB.COM/x と Foo's と Foo’s と Foo'sx と Foo-",
+    'Character.AI と CHARACTER.AI と character.ai.example.com と x.character.ai と @character.ai と Character.AI.',
+    "Booking.com と www.booking.com と booking.com/a と Booking.com's と Character.AI-9 と example.com",
+    'NASA と API と GPU と PS5 と Api と nasa と APIs',
+    'MacBook\nPro と MacBook \r\n Pro と Hugging\nFace と Hugging　Face と Hugging\tFace と Foo \n Bar',
+  ];
+  for (const text of texts) assertSameAsLegacy(r, text, text);
+});
+
+test('照合の結果が変更前の実装と同じ（乱数の例）', () => {
+  const rand = prng(19);
+  const pick = <T>(xs: readonly T[]): T => xs[Math.floor(rand() * xs.length)]!;
+  const surfaceChars = ['a', 'b', 'A', 'B', 'k', 's', '1', '2', ' ', '-', '.', "'", '+', 'é', 'É', 'σ', 'ς', 'Σ', 'ア', '日'];
+  const textChars = [...surfaceChars, '　', '\t', '  ', '\n', '@', '/', '’', 'x', 'K', 'ſ', '😀', 'ｂ', '\uD800'];
+  const textParts = [
+    'https://ab.com/a', 'a@b.com', 'ab.com', 'ab.io/x', "'s", '-1', '-a', 'AB', 'ABA', 'KAB',
+    'a\nb', 'ab\nab', 'a \n b', 'A\r\nB', 'x.ab.com', 'ab.ai.b.com', 'ab.com.', '.ab.com', '@ab.com', 'a.b.io', 'AB.AI', 'b.ab.co/a',
+  ];
+  // #28 の規則が効く形の surface（ドットを含む・全部大文字・空白を含む・ドメインの形）
+  const surfaceParts = ['ab.com', 'a.b', 'A.I', 'ab.ai', '.ab', 'AB', 'ABA', 'AB1', 'K', 'a b', 'ab', 'b.io'];
+  for (let round = 0; round < 80; round++) {
+    const pairs: [string, string][] = [];
+    for (let i = 0; i < 12; i++) {
+      let s = '';
+      if (rand() < 0.3) s = pick(surfaceParts);
+      else {
+        const len = 1 + Math.floor(rand() * 5);
+        for (let j = 0; j < len; j++) s += pick(surfaceChars);
+      }
+      if (rand() < 0.2) s = s.toUpperCase();
+      pairs.push([s, pick(['ア', 'イー', 'ウ ウ'])]);
+    }
+    const r = compileReadings(rows(pairs, pick(['builtin', 'user', 'request'] as const)));
+    for (let t = 0; t < 25; t++) {
+      let text = '';
+      const len = Math.floor(rand() * 40);
+      for (let j = 0; j < len; j++) text += rand() < 0.15 ? pick(textParts) : rand() < 0.3 ? pick(pairs)[0] : pick(textChars);
+      assertSameAsLegacy(r, text, JSON.stringify({ pairs, text }));
+    }
+  }
+});
+
+test('照合の結果が変更前の実装と同じ（組み込みの辞書）', () => {
+  const r = compileReadings(parseReadingsTsv(readFileSync(join(PACKAGE_DIR, 'dict', 'readings.tsv'), 'utf8')));
+  const words = r.entries().map(e => e.surface);
+  const rand = prng(7);
+  const pick = <T>(xs: readonly T[]): T => xs[Math.floor(rand() * xs.length)]!;
+  const glue = [' ', '、', 'と', "'s ", '-9 ', '-a ', 'x', '1', '. ', ' https://github.com/a ', ' a@b.jp ', ' foo.dev ', '　', '\n', ' \n ', '.com ', '.ai ', '.example.com '];
+  for (let t = 0; t < 200; t++) {
+    let text = '';
+    const len = Math.floor(rand() * 30);
+    for (let j = 0; j < len; j++) {
+      const w = pick(words);
+      text += (rand() < 0.3 ? w.toUpperCase() : rand() < 0.3 ? w.toLowerCase() : w) + pick(glue);
+    }
+    assertSameAsLegacy(r, text, text);
+  }
 });
