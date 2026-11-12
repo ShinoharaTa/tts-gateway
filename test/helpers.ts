@@ -88,7 +88,7 @@ export class FakeEngine implements Engine {
   }
 
   status(): EngineStatus {
-    return { id: this.id, loaded: null, kernel: null, process: null, idleUnloadSec: this.settings?.().idleUnloadSec ?? 0 };
+    return { id: this.id, loaded: null, kernel: null, process: null, processes: [], idleUnloadSec: this.settings?.().idleUnloadSec ?? 0 };
   }
 
   async close(): Promise<void> {}

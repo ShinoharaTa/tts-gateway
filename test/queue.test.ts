@@ -145,9 +145,8 @@ test('2 スロット: 他のスロットが読み込んでいる声は後回し�
   assert.deepEqual(started, ['b3@1']);
 });
 
-test(`2 スロット: 先頭が ${AFFINITY_MAX_WAIT_MS}ms 以上待ったら追い越さない`, async () => {
-  let now = 0;
-  const q = new SynthQueue({ concurrency: 2, max: 8, now: () => now });
+/** スロット 1 を B で塞いだまま、待ちに C（最も古い）と A を 3 つ置く。スロット 0 は A を流す */
+const crowded = async (q: SynthQueue) => {
   const started: string[] = [];
   const add = (name: string, voice: string, gate: Promise<void>) =>
     q.run(undefined, async slot => {
@@ -158,28 +157,64 @@ test(`2 スロット: 先頭が ${AFFINITY_MAX_WAIT_MS}ms 以上待ったら追�
   const slot0 = [deferred<void>()];
   const runs = [add('a0', 'A', slot0[0]!.promise), add('b0', 'B', hold.promise)];
   await flush();
-  // スロット 1 は B で塞いだまま、待ちに C（最も古い）を置き、A を足し続ける
   runs.push(add('c', 'C', Promise.resolve()));
   for (let i = 1; i <= 3; i++) {
     const g = deferred<void>();
     slot0.push(g);
     runs.push(add(`a${i}`, 'A', g.promise));
   }
-  // 4.9 秒までは A が C を追い越す
-  now = 4900;
+  const done = async () => {
+    hold.resolve();
+    for (const g of slot0) g.resolve();
+    await Promise.all(runs);
+  };
+  return { started, slot0, done };
+};
+
+test(`2 スロット: 最初に追い越されてから ${AFFINITY_MAX_WAIT_MS}ms 以上たった要求は声が違っても流す`, async () => {
+  let now = 0;
+  const q = new SynthQueue({ concurrency: 2, max: 8, now: () => now });
+  const { started, slot0, done } = await crowded(q);
+  // 1 秒: A が C を追い越す（C の起点は 1 秒）
+  now = 1000;
   slot0[0]!.resolve();
   await flush();
   assert.deepEqual(started.slice(2), ['a1@0']);
-  // 5 秒を過ぎたら、声が違っても先頭の C
-  now = 5000;
+  // 起点から 4.9 秒: まだ追い越す（待ち行列に入ってからなら 5 秒を過ぎている）
+  now = 5900;
   slot0[1]!.resolve();
   await flush();
-  assert.deepEqual(started.slice(3, 4), ['c@0']);
+  assert.deepEqual(started.slice(3), ['a2@0']);
+  // 起点から 5 秒: 声が違っても C
+  now = 6000;
+  slot0[2]!.resolve();
   await flush();
-  assert.deepEqual(started.slice(4), ['a2@0']);
-  hold.resolve();
-  for (const g of slot0) g.resolve();
-  await Promise.all(runs);
+  assert.deepEqual(started.slice(4, 5), ['c@0']);
+  await flush();
+  assert.deepEqual(started.slice(5), ['a3@0']);
+  await done();
+});
+
+test('2 スロット: 上限は注入でき、待ち行列に入って 15 秒たった要求は追い越しにかかわらず最優先', async () => {
+  let now = 0;
+  const q = new SynthQueue({ concurrency: 2, max: 8, now: () => now, affinityMaxWaitMs: 60_000 });
+  const { started, slot0, done } = await crowded(q);
+  // 12 秒: 初めて追い越される（起点 12 秒、上限 60 秒）
+  now = 12_000;
+  slot0[0]!.resolve();
+  await flush();
+  assert.deepEqual(started.slice(2), ['a1@0']);
+  // 14.9 秒: まだ追い越す
+  now = 14_900;
+  slot0[1]!.resolve();
+  await flush();
+  assert.deepEqual(started.slice(3), ['a2@0']);
+  // 15 秒: 起点からは 3 秒だが、待ち行列に入ってから 15 秒なので C
+  now = 15_000;
+  slot0[2]!.resolve();
+  await flush();
+  assert.deepEqual(started.slice(4, 5), ['c@0']);
+  await done();
 });
 
 test('1 スロットは声に関係なく FIFO', async () => {

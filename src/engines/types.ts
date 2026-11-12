@@ -16,7 +16,10 @@ export type EngineStatus = {
   /** 読み込み中の声（無ければ null） */
   loaded: string | null;
   kernel: string | null;
+  /** loaded・kernel・process は 1 プロセス分（互換のため）。全部は processes */
   process: { pid: number; rssBytes: number | null } | null;
+  /** スロットごとの合成プロセス（スロット順。合成プロセスを持たないエンジンは空） */
+  processes: { slot: number; voice: string; pid: number; state: 'starting' | 'idle' | 'busy'; rssBytes: number | null }[];
   idleUnloadSec: number;
 };
 

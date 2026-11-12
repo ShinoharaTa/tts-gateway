@@ -5,7 +5,7 @@
  * - 子プロセスは poolSize（TTS_CONCURRENCY）個まで。待ち行列のスロット 1 つに子 1 つで、子ごとに 1 つの声を読む
  *   （どのスロットにどの要求を流すかは queue.ts が決める）
  * - そのスロットの子と別の声の文が来たら、その子を終了してその声で起動し直す（待ちは FIFO）
- * - idleUnloadSec 使われなければ子を全部終了してメモリを返す（0 は解放しない）
+ * - スロットごとに、idleUnloadSec 使われなければその子を終了してメモリを返す（0 は解放しない）
  * - 子が落ちたら合成中の文は 503。次の文で起動し直す。1 文 30 秒を超えたら子を終了して 504
  * - このファイルは zen-tts を読み込まない（読み込むのは子だけ。親のメモリを増やさない）
  */
@@ -166,6 +166,8 @@ type Child = {
   kernel: string | null;
   /** 合成中の文 */
   job: { id: number; resolve: (pcm: Float32Array) => void; reject: (e: Error) => void } | null;
+  /** stop() で意図的に終了した（exit / error で他の待ちを失敗させない） */
+  stopping: boolean;
 };
 
 type Waiter = { voice: ModelRecord; slot: number; resolve: (c: Child) => void; reject: (e: Error) => void };
@@ -208,7 +210,8 @@ export class ZenTtsEngine implements Engine {
   private readonly sentenceTimeoutMs: number;
   private children: Child[] = [];
   private readonly waiters: Waiter[] = [];
-  private idleTimer: NodeJS.Timeout | null = null;
+  /** スロット → アイドル解放のタイマー */
+  private readonly idleTimers = new Map<number, NodeJS.Timeout>();
   private nextId = 0;
   private closed = false;
 
@@ -261,29 +264,35 @@ export class ZenTtsEngine implements Engine {
     } finally {
       if (child.state === 'busy') child.state = 'idle';
       this.schedule();
-      this.armIdle();
+      this.armIdle(child.slot);
     }
   }
 
   status(): EngineStatus {
+    // loaded・kernel・process は互換のため 1 プロセス分（読み込み済みの最初の子）
     const live = this.children.find(c => c.state !== 'starting') ?? this.children[0];
     return {
       id: this.id,
       loaded: live && live.state !== 'starting' ? live.voiceId : null,
       kernel: live?.kernel ?? null,
       process: live?.proc.pid ? { pid: live.proc.pid, rssBytes: rssOf(live.proc.pid) } : null,
+      processes: this.children
+        .filter(c => c.proc.pid)
+        .sort((a, b) => a.slot - b.slot)
+        .map(c => ({ slot: c.slot, voice: c.voiceId, pid: c.proc.pid!, state: c.state, rssBytes: rssOf(c.proc.pid!) })),
       idleUnloadSec: this.settings().idleUnloadSec,
     };
   }
 
   /** 設定の idleUnloadSec が変わったとき */
   settingsChanged(): void {
-    this.armIdle();
+    for (const c of this.children) this.armIdle(c.slot);
   }
 
   async close(): Promise<void> {
     this.closed = true;
-    if (this.idleTimer) clearTimeout(this.idleTimer);
+    for (const t of this.idleTimers.values()) clearTimeout(t);
+    this.idleTimers.clear();
     for (const w of this.waiters.splice(0)) w.reject(unavailable('engine is closed'));
     this.killAll();
   }
@@ -338,10 +347,7 @@ export class ZenTtsEngine implements Engine {
 
   private acquire(voice: ModelRecord, slot: number, signal: AbortSignal, abortReason: () => Error): Promise<Child> {
     if (this.closed) return Promise.reject(unavailable('engine is closed'));
-    if (this.idleTimer) {
-      clearTimeout(this.idleTimer);
-      this.idleTimer = null;
-    }
+    this.clearIdle(slot);
     return new Promise((resolve, reject) => {
       const onAbort = (): void => {
         const i = this.waiters.indexOf(waiter);
@@ -394,7 +400,7 @@ export class ZenTtsEngine implements Engine {
 
   private spawn(voice: ModelRecord, slot: number): void {
     const proc = this.forkChild();
-    const child: Child = { proc, slot, voiceId: voice.id, state: 'starting', kernel: null, job: null };
+    const child: Child = { proc, slot, voiceId: voice.id, state: 'starting', kernel: null, job: null, stopping: false };
     this.children.push(child);
     const modelPath = this.registry.modelPath(this.id, voice.id, this.modelExt);
     this.waitReady(proc, modelPath).then(
@@ -409,19 +415,24 @@ export class ZenTtsEngine implements Engine {
           if (m.type === 'result') job.resolve(m.pcm!);
           else job.reject(unavailable(`synthesis failed: ${m.message}`));
         });
-        proc.on('exit', (code, sig) => {
+        const onGone = (e: Error): void => {
+          // stop() で止めた子・もう管理していない子は、待ちに触れない
+          if (child.stopping || !this.children.includes(child)) return;
           this.drop(child);
-          child.job?.reject(unavailable(`synthesis process exited (${sig ?? `code ${code}`})`));
+          child.job?.reject(e);
           child.job = null;
           this.schedule();
-        });
+        };
+        proc.on('exit', (code, sig) => onGone(unavailable(`synthesis process exited (${sig ?? `code ${code}`})`)));
+        proc.on('error', e => onGone(unavailable(`synthesis process failed: ${e.message}`)));
         this.schedule();
       },
       (e: Error) => {
         proc.kill('SIGKILL');
+        if (child.stopping || !this.children.includes(child)) return;
         this.drop(child);
-        // この声を待っている要求は同じ理由で失敗する
-        for (const w of this.waiters.filter(x => x.voice.id === voice.id)) {
+        // この子を待っている要求（同じスロット・同じ声）は同じ理由で失敗する。他のスロットの待ちには触れない
+        for (const w of this.waiters.filter(x => x.slot === slot && x.voice.id === voice.id)) {
           this.waiters.splice(this.waiters.indexOf(w), 1);
           w.reject(e);
         }
@@ -476,6 +487,7 @@ export class ZenTtsEngine implements Engine {
 
   /** 子を 1 つ終了する（合成中の文は 503） */
   private stop(child: Child): void {
+    child.stopping = true;
     this.drop(child);
     child.job?.reject(unavailable('synthesis process was stopped'));
     child.job = null;
@@ -486,19 +498,27 @@ export class ZenTtsEngine implements Engine {
     for (const c of [...this.children]) this.stop(c);
   }
 
-  /** すべての子が空いていて待ちが無ければ、idleUnloadSec 後に子を終了する */
-  private armIdle(): void {
-    if (this.idleTimer) {
-      clearTimeout(this.idleTimer);
-      this.idleTimer = null;
-    }
+  private clearIdle(slot: number): void {
+    const t = this.idleTimers.get(slot);
+    if (t) clearTimeout(t);
+    this.idleTimers.delete(slot);
+  }
+
+  /** そのスロットの子が空いていてそのスロットの待ちが無ければ、idleUnloadSec 後にその子を終了する */
+  private armIdle(slot: number): void {
+    this.clearIdle(slot);
     const sec = this.settings().idleUnloadSec;
-    if (sec <= 0 || this.closed || this.children.length === 0) return;
-    if (this.waiters.length > 0 || this.children.some(c => c.state !== 'idle')) return;
-    this.idleTimer = setTimeout(() => {
-      this.idleTimer = null;
-      if (this.waiters.length === 0 && this.children.every(c => c.state === 'idle')) this.killAll();
+    const idle = (): Child | undefined => {
+      const c = this.children.find(x => x.slot === slot);
+      return c && c.state === 'idle' && !this.waiters.some(w => w.slot === slot) ? c : undefined;
+    };
+    if (sec <= 0 || this.closed || !idle()) return;
+    const timer = setTimeout(() => {
+      this.idleTimers.delete(slot);
+      const c = idle();
+      if (c) this.stop(c);
     }, sec * 1000);
-    this.idleTimer.unref();
+    timer.unref();
+    this.idleTimers.set(slot, timer);
   }
 }

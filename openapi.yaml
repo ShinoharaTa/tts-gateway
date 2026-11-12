@@ -983,7 +983,7 @@ components:
     EngineStatus:
       type: object
       additionalProperties: false
-      required: [id, loaded, kernel, process, idleUnloadSec]
+      required: [id, loaded, kernel, process, processes, idleUnloadSec]
       properties:
         id:
           type: string
@@ -1004,6 +1004,27 @@ components:
                   type: integer
                 rssBytes:
                   type: [integer, 'null']
+        processes:
+          type: array
+          description: スロットごとの合成プロセス（スロット順。プロセスの無いスロットは載らない）
+          items:
+            type: object
+            additionalProperties: false
+            required: [slot, voice, pid, state, rssBytes]
+            properties:
+              slot:
+                type: integer
+                minimum: 0
+              voice:
+                type: string
+                description: このプロセスが読む（starting なら読み込み中の）声
+              pid:
+                type: integer
+              state:
+                type: string
+                enum: [starting, idle, busy]
+              rssBytes:
+                type: [integer, 'null']
         idleUnloadSec:
           type: integer
     Status:

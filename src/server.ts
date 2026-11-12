@@ -57,7 +57,7 @@ export const createApp = async (config: Config, o: AppOverrides = {}): Promise<A
     ttlMs: () => settings.get().cacheTtlDays * 86_400_000,
   });
   await cache.init();
-  const queue = new SynthQueue({ concurrency: config.concurrency, max: config.queueMax });
+  const queue = new SynthQueue({ concurrency: config.concurrency, max: config.queueMax, affinityMaxWaitMs: config.affinityMaxWaitMs });
   const dictionary = await Dictionary.load(join(config.packageDir, 'dict', 'readings.tsv'), join(config.dataDir, 'readings.tsv'));
   const catalog = loadCatalog(join(config.packageDir, 'catalog'));
   const downloader = new ModelDownloader({
