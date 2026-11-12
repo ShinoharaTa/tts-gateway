@@ -136,12 +136,14 @@ export const renderAudio = async (o: {
   options: Record<string, unknown>;
   signal: AbortSignal;
   ffmpeg: string;
+  /** 待ち行列のスロット（エンジンの合成プロセス）。省略時は 0 */
+  slot?: number;
 }): Promise<{ audio: Buffer; durationMs: number; sampleRate: number }> => {
   const sr = o.engine.sampleRate;
   const p = o.params;
   const parts: Float32Array[] = [silence(p.leadingSilenceMs, sr)];
   for (const [i, sentence] of o.sentences.entries()) {
-    let pcm = await o.engine.synthesize(sentence, o.voice, o.options, o.signal);
+    let pcm = await o.engine.synthesize(sentence, o.voice, o.options, o.signal, o.slot ?? 0);
     if (p.trimSilence) pcm = trimSilence(pcm, sr);
     if (i > 0) parts.push(silence(p.sentencePauseMs, sr));
     parts.push(pcm);
@@ -241,7 +243,7 @@ export class Synthesizer {
     }
 
     // キャッシュを使わない要求は合流しない（毎回作る）
-    const { promise } = this.d.queue.run(useCache ? key : undefined, async () => {
+    const { promise } = this.d.queue.run(useCache ? key : undefined, async slot => {
       const started = performance.now();
       const ac = new AbortController();
       const timer = setTimeout(
@@ -249,7 +251,7 @@ export class Synthesizer {
         this.d.timeoutSec * 1000,
       );
       try {
-        const r = await renderAudio({ engine, voice, sentences, params, options: req.options, signal: ac.signal, ffmpeg: this.d.ffmpeg });
+        const r = await renderAudio({ engine, voice, sentences, params, options: req.options, signal: ac.signal, ffmpeg: this.d.ffmpeg, slot });
         const synthesisMs = Math.round(performance.now() - started);
         if (useCache) {
           await this.d.cache
@@ -260,7 +262,7 @@ export class Synthesizer {
       } finally {
         clearTimeout(timer);
       }
-    });
+    }, `${engine.id}/${voice.id}`);
     const r = await promise;
     return {
       audio: r.audio, contentType, engine, voice: voice.id, durationMs: r.durationMs, sampleRate: r.sampleRate,

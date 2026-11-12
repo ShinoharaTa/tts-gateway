@@ -2,8 +2,9 @@
  * ZEN-TTS エンジン（docs/design.md「ZEN-TTS エンジン」）。合成は child.ts を child_process.fork した子プロセスで行う
  * （worker_threads では解放しても RSS が戻らないため）。
  *
- * - 子プロセスは poolSize（TTS_CONCURRENCY）個まで。すべて同じ 1 つの声を読む
- * - 別の声の文が来たら、合成中の文が終わるのを待ってから子を全部終了し、その声で起動し直す（待ちは FIFO）
+ * - 子プロセスは poolSize（TTS_CONCURRENCY）個まで。待ち行列のスロット 1 つに子 1 つで、子ごとに 1 つの声を読む
+ *   （どのスロットにどの要求を流すかは queue.ts が決める）
+ * - そのスロットの子と別の声の文が来たら、その子を終了してその声で起動し直す（待ちは FIFO）
  * - idleUnloadSec 使われなければ子を全部終了してメモリを返す（0 は解放しない）
  * - 子が落ちたら合成中の文は 503。次の文で起動し直す。1 文 30 秒を超えたら子を終了して 504
  * - このファイルは zen-tts を読み込まない（読み込むのは子だけ。親のメモリを増やさない）
@@ -158,6 +159,8 @@ const LOAD_TIMEOUT_MS = 120_000;
 
 type Child = {
   proc: ChildProcess;
+  /** 待ち行列のスロット */
+  slot: number;
   voiceId: string;
   state: 'starting' | 'idle' | 'busy';
   kernel: string | null;
@@ -165,7 +168,7 @@ type Child = {
   job: { id: number; resolve: (pcm: Float32Array) => void; reject: (e: Error) => void } | null;
 };
 
-type Waiter = { voice: ModelRecord; resolve: (c: Child) => void; reject: (e: Error) => void };
+type Waiter = { voice: ModelRecord; slot: number; resolve: (c: Child) => void; reject: (e: Error) => void };
 
 const unavailable = (msg: string): ApiError => new ApiError(503, 'engine_unavailable', msg);
 const timeout = (msg: string): ApiError => new ApiError(504, 'timeout', msg);
@@ -204,7 +207,6 @@ export class ZenTtsEngine implements Engine {
   private readonly childPath: string;
   private readonly sentenceTimeoutMs: number;
   private children: Child[] = [];
-  private currentVoice: string | null = null;
   private readonly waiters: Waiter[] = [];
   private idleTimer: NodeJS.Timeout | null = null;
   private nextId = 0;
@@ -249,11 +251,11 @@ export class ZenTtsEngine implements Engine {
     }
   }
 
-  async synthesize(sentence: string, voice: ModelRecord, opts: ZenTtsOptions, signal: AbortSignal): Promise<Float32Array> {
+  async synthesize(sentence: string, voice: ModelRecord, opts: ZenTtsOptions, signal: AbortSignal, slot = 0): Promise<Float32Array> {
     const abortReason = (): Error =>
       signal.reason instanceof ApiError ? signal.reason : timeout('synthesis was aborted');
     if (signal.aborted) throw abortReason();
-    const child = await this.acquire(voice, signal, abortReason);
+    const child = await this.acquire(voice, Math.min(Math.max(0, slot), this.poolSize - 1), signal, abortReason);
     try {
       return await this.speakOn(child, sentence, opts, signal, abortReason);
     } finally {
@@ -334,7 +336,7 @@ export class ZenTtsEngine implements Engine {
     });
   }
 
-  private acquire(voice: ModelRecord, signal: AbortSignal, abortReason: () => Error): Promise<Child> {
+  private acquire(voice: ModelRecord, slot: number, signal: AbortSignal, abortReason: () => Error): Promise<Child> {
     if (this.closed) return Promise.reject(unavailable('engine is closed'));
     if (this.idleTimer) {
       clearTimeout(this.idleTimer);
@@ -349,6 +351,7 @@ export class ZenTtsEngine implements Engine {
       };
       const waiter: Waiter = {
         voice,
+        slot,
         resolve: c => {
           signal.removeEventListener('abort', onAbort);
           resolve(c);
@@ -364,31 +367,34 @@ export class ZenTtsEngine implements Engine {
     });
   }
 
-  /** 待ちの先頭から、空いた子を割り当てる。声が違えば、合成中の文が終わってから子を入れ替える */
+  /** 待ちの古い順に、そのスロットの子を割り当てる。声が違えば、合成中の文が終わってからその子を入れ替える */
   private schedule(): void {
-    while (this.waiters.length > 0) {
-      const w = this.waiters[0]!;
-      if (this.currentVoice !== w.voice.id) {
-        if (this.children.some(c => c.state === 'busy')) return;
-        this.killAll();
-        this.currentVoice = w.voice.id;
+    // スロットごとに最も古い待ちだけを見る（スロット内は FIFO）
+    const seen = new Set<number>();
+    for (const w of [...this.waiters]) {
+      if (seen.has(w.slot)) continue;
+      seen.add(w.slot);
+      let child = this.children.find(c => c.slot === w.slot);
+      if (child && child.voiceId !== w.voice.id) {
+        if (child.state === 'busy') continue;
+        this.stop(child);
+        child = undefined;
       }
-      const idle = this.children.find(c => c.state === 'idle');
-      if (idle) {
-        this.waiters.shift();
-        idle.state = 'busy';
-        w.resolve(idle);
+      if (child) {
+        if (child.state !== 'idle') continue;
+        this.waiters.splice(this.waiters.indexOf(w), 1);
+        child.state = 'busy';
+        w.resolve(child);
         continue;
       }
       // 起動中の子があればその ready を待つ（同時に起動するのは 1 つずつ）
-      if (this.children.length < this.poolSize && !this.children.some(c => c.state === 'starting')) this.spawn(w.voice);
-      return;
+      if (!this.children.some(c => c.state === 'starting')) this.spawn(w.voice, w.slot);
     }
   }
 
-  private spawn(voice: ModelRecord): void {
+  private spawn(voice: ModelRecord, slot: number): void {
     const proc = this.forkChild();
-    const child: Child = { proc, voiceId: voice.id, state: 'starting', kernel: null, job: null };
+    const child: Child = { proc, slot, voiceId: voice.id, state: 'starting', kernel: null, job: null };
     this.children.push(child);
     const modelPath = this.registry.modelPath(this.id, voice.id, this.modelExt);
     this.waitReady(proc, modelPath).then(
@@ -466,16 +472,18 @@ export class ZenTtsEngine implements Engine {
   private drop(child: Child): void {
     const i = this.children.indexOf(child);
     if (i >= 0) this.children.splice(i, 1);
-    if (this.children.length === 0 && this.waiters.length === 0) this.currentVoice = null;
+  }
+
+  /** 子を 1 つ終了する（合成中の文は 503） */
+  private stop(child: Child): void {
+    this.drop(child);
+    child.job?.reject(unavailable('synthesis process was stopped'));
+    child.job = null;
+    child.proc.kill('SIGKILL');
   }
 
   private killAll(): void {
-    for (const c of this.children.splice(0)) {
-      c.job?.reject(unavailable('synthesis process was stopped'));
-      c.job = null;
-      c.proc.kill('SIGKILL');
-    }
-    this.currentVoice = null;
+    for (const c of [...this.children]) this.stop(c);
   }
 
   /** すべての子が空いていて待ちが無ければ、idleUnloadSec 後に子を終了する */

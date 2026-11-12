@@ -40,8 +40,11 @@ export interface Engine {
   sentenceCharLimit?(opts: EngineOptions): number;
   /** 取得後の検査。読めなければ例外 */
   verifyModel(path: string): Promise<{ voiceId: string }>;
-  /** 1 文を合成する（sampleRate のモノラル float32） */
-  synthesize(sentence: string, voice: ModelRecord, opts: EngineOptions, signal: AbortSignal): Promise<Float32Array>;
+  /**
+   * 1 文を合成する（sampleRate のモノラル float32）。slot は待ち行列のスロット（0〜TTS_CONCURRENCY-1）で、
+   * 同じ slot には同時に 1 要求しか来ない。合成プロセスを持つエンジンは slot ごとにプロセスを分ける
+   */
+  synthesize(sentence: string, voice: ModelRecord, opts: EngineOptions, signal: AbortSignal, slot: number): Promise<Float32Array>;
   status(): EngineStatus;
   close(): Promise<void>;
 }

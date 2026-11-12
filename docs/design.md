@@ -60,7 +60,7 @@ interface Engine {
   voices(): VoiceInfo[];                   // registry のインストール済みモデルから
   validateOptions(raw: unknown): EngineOptions;   // 範囲外・未知は ApiError 400
   verifyModel(path: string): Promise<{ voiceId: string }>;  // 取得後の検査
-  synthesize(sentence: string, voice: ModelRecord, opts: EngineOptions, signal: AbortSignal): Promise<Float32Array>;
+  synthesize(sentence: string, voice: ModelRecord, opts: EngineOptions, signal: AbortSignal, slot: number): Promise<Float32Array>;  // slot: 待ち行列のスロット
   status(): EngineStatus;
   close(): Promise<void>;
 }
@@ -72,7 +72,15 @@ interface Engine {
 ## ZEN-TTS エンジン
 
 - 合成は `child_process.fork`（`serialization: 'advanced'` で Float32Array を受け渡す）。worker_threads では解放しても RSS が戻らないため。
-- 子プロセスは同時に 1 つの声だけ読む。別の声が来たら、今の合成が終わってから子を終了して起動し直す。
+- 子プロセスは待ち行列のスロット（`TTS_CONCURRENCY` 個）ごとに 1 つで、それぞれ 1 つの声だけ読む。
+  そのスロットに別の声が来たら、今の合成が終わってからその子を終了して起動し直す（起動は同時に 1 つずつ）。
+- どのスロットにどの要求を流すかは `queue.ts` が決める。スロットは最後に流した声を覚え、空いたら待ち行列から次の順で 1 件取る
+  （`TTS_CONCURRENCY=1` は FIFO のまま）:
+  1. 先頭の要求が `AFFINITY_MAX_WAIT_MS`（5000）以上待っていれば先頭（追い越され続けないため）
+  2. このスロットの声と同じ声の最も古い要求
+  3. 他のスロットが読み込んでいない声の最も古い要求
+  4. 先頭
+  空きが 2 つあるときは、取る要求の声を読み込んでいるスロットに流す。スロットには `Engine.synthesize` の `slot` で渡す。
 - `idleUnloadSec` 使われなければ子を終了。子が落ちたら合成中の要求は 503、次の要求で起動し直す。
 - 1 文ごとに `speak()`（`speakStream` は使わない。文分割は共通層）。1 文の合成 30 秒、要求全体 `TTS_TIMEOUT_SEC`（既定 60）でタイムアウト。
 - `ZenTtsNode.load({ model })`: `modelsPath` は渡さない（G2P はパッケージ同梱）。
