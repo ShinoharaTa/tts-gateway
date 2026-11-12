@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f6f6f4">
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#161616">
+  <meta name="robots" content="noindex">
+  <title>tts-gateway 設定</title>
+  <link rel="stylesheet" href="admin.css">
+  <script src="admin.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <h1>tts-gateway</h1>
+    <span class="muted" id="version"></span>
+  </header>
+
+  <main>
+    <section class="card" id="token-card" hidden>
+      <h2>トークン</h2>
+      <p class="muted">このサーバーはトークンが必要です。入力したトークンはこのブラウザ（localStorage）に保存します。</p>
+      <form id="token-form" class="row">
+        <input id="token-input" type="password" autocomplete="off" placeholder="TTS_ADMIN_TOKEN または TTS_TOKEN" aria-label="トークン" required>
+        <button type="submit">保存</button>
+      </form>
+      <p class="msg" id="token-msg" role="status"></p>
+    </section>
+
+    <section class="card" id="status-card">
+      <div class="card-head">
+        <h2>状態</h2>
+        <button type="button" class="ghost" id="status-refresh">更新</button>
+      </div>
+      <dl class="stats" id="status"></dl>
+      <p class="msg" id="status-msg" role="status"></p>
+    </section>
+
+    <section class="card" id="try-card">
+      <h2>試聴</h2>
+      <form id="try-form" class="stack">
+        <label class="field">
+          <span>テキスト</span>
+          <textarea id="try-text" rows="3" required>GitHub に Claude のコードを push しました。</textarea>
+        </label>
+        <div class="grid">
+          <label class="field">
+            <span>声</span>
+            <select id="try-voice"></select>
+          </label>
+          <label class="field">
+            <span>形式</span>
+            <select id="try-format">
+              <option value="mp3">mp3</option>
+              <option value="wav">wav</option>
+              <option value="opus">opus（Ogg）</option>
+              <option value="m4a">m4a（AAC）</option>
+              <option value="flac">flac</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>感情</span>
+            <select id="try-emotion">
+              <option value="neutral">ふつう（neutral）</option>
+              <option value="happy">喜び（happy）</option>
+              <option value="sad">悲しみ（sad）</option>
+              <option value="angry">怒り（angry）</option>
+              <option value="apologetic">申し訳なさ（apologetic）</option>
+            </select>
+          </label>
+        </div>
+        <label class="field">
+          <span>速さ <output id="try-speed-out">1.0</output></span>
+          <input id="try-speed" type="range" min="0.5" max="1.5" step="0.05" value="1">
+        </label>
+        <label class="field">
+          <span>高さ（半音） <output id="try-pitch-out">0</output></span>
+          <input id="try-pitch" type="range" min="-6" max="12" step="1" value="0">
+        </label>
+        <div class="row">
+          <button type="submit" id="try-submit">合成</button>
+          <a id="try-download" class="button ghost" hidden>ダウンロード</a>
+        </div>
+      </form>
+      <p class="msg" id="try-msg" role="status"></p>
+      <audio id="try-audio" controls hidden></audio>
+      <div id="try-normalize" hidden>
+        <h3>読み</h3>
+        <p class="spoken" id="try-spoken"></p>
+        <h3>辞書に無い語</h3>
+        <p class="muted" id="try-unknown-empty">ありません。</p>
+        <div class="chips" id="try-unknown"></div>
+      </div>
+    </section>
+
+    <section class="card" id="models-card">
+      <h2>モデル</h2>
+      <ul class="list" id="models"></ul>
+      <h3>カタログから追加</h3>
+      <form id="catalog-form" class="row">
+        <select id="catalog-select" aria-label="カタログのモデル"></select>
+        <button type="submit">追加</button>
+      </form>
+      <details class="more">
+        <summary>URL で追加</summary>
+        <form id="url-form" class="stack">
+          <label class="field"><span>id（英小文字・数字・_-）</span><input id="url-id" required pattern="[a-z0-9][a-z0-9_\-]{0,31}" autocomplete="off" autocapitalize="off"></label>
+          <label class="field"><span>名前</span><input id="url-name" autocomplete="off"></label>
+          <label class="field"><span>URL（https）</span><input id="url-url" type="url" required placeholder="https://tts-models.zenryoku.work/v1.3.0/kikka.ztm" autocapitalize="off"></label>
+          <label class="field"><span>sha256（任意）</span><input id="url-sha" pattern="[0-9a-fA-F]{64}" autocomplete="off" autocapitalize="off"></label>
+          <div class="row"><button type="submit">追加</button></div>
+        </form>
+      </details>
+      <p class="msg" id="models-msg" role="status"></p>
+    </section>
+
+    <section class="card" id="dict-card">
+      <h2>読み辞書</h2>
+      <form id="dict-form" class="stack">
+        <div class="grid two">
+          <label class="field"><span>語</span><input id="dict-surface" required autocomplete="off" autocapitalize="off"></label>
+          <label class="field"><span>読み（カタカナ）</span><input id="dict-reading" required autocomplete="off"></label>
+        </div>
+        <div class="row"><button type="submit">追加・更新</button></div>
+      </form>
+      <p class="msg" id="dict-msg" role="status"></p>
+      <label class="field">
+        <span>絞り込み <span class="muted" id="dict-count"></span></span>
+        <input id="dict-filter" type="search" autocomplete="off" autocapitalize="off">
+      </label>
+      <ul class="list dict" id="dict"></ul>
+    </section>
+
+    <section class="card" id="settings-card">
+      <h2>設定</h2>
+      <form id="settings-form" class="stack">
+        <label class="field"><span>既定の声</span><select id="set-voice"></select></label>
+        <label class="field"><span>使われなければ解放するまでの秒数（0 は解放しない、60〜86400）</span><input id="set-idle" type="number" inputmode="numeric" min="0" max="86400" required></label>
+        <label class="field"><span>キャッシュの上限 MB（0 は無効、〜10000）</span><input id="set-cache-mb" type="number" inputmode="numeric" min="0" max="10000" required></label>
+        <label class="field"><span>キャッシュの保存日数（1〜365）</span><input id="set-ttl" type="number" inputmode="numeric" min="1" max="365" required></label>
+        <div class="row">
+          <button type="submit">保存</button>
+          <button type="button" class="ghost danger" id="cache-clear">キャッシュを消す</button>
+        </div>
+      </form>
+      <p class="msg" id="settings-msg" role="status"></p>
+    </section>
+
+    <section class="card" id="credit-card">
+      <h2>クレジット</h2>
+      <p class="credit">音声合成：ZEN-TTS（<a href="https://zenryokukikai.com" target="_blank" rel="noopener">https://zenryokukikai.com</a>）</p>
+      <p class="muted">このサーバーは ZEN-TTS を使っています。ここで作った音声を使うアプリ・サイト・作品でも、利用者が見つけられる場所に上のクレジットを表示してください（URL はリンクにします）。改変・重みの再配布・機械学習の学習／蒸留／評価への利用はできません。詳しくは <a href="https://github.com/zenryokukikai/zen-tts/blob/v1.3.0/LICENSE.md" target="_blank" rel="noopener">ZEN-TTS ライセンス</a>。</p>
+    </section>
+  </main>
+</body>
+</html>

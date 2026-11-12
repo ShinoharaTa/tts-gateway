@@ -1,0 +1,34 @@
+{
+  "engine": "zen-tts",
+  "version": "1.3.0",
+  "models": [
+    {
+      "id": "marine",
+      "name": "全力 マリン",
+      "url": "https://tts-models.zenryoku.work/v1.3.0/marine.ztm",
+      "sha256": "c7bdad381540d33f90aa60b255520051b04d6ce84c66e0fbc8d8ed3cdec3a4dd",
+      "bytes": 27650080
+    },
+    {
+      "id": "hashiro",
+      "name": "全力 ハシロウ",
+      "url": "https://tts-models.zenryoku.work/v1.3.0/hashiro.ztm",
+      "sha256": "17d8f69ae8c45c3390ca06f15f30b7bc15c8be74d76c35ca0b9fe30851895433",
+      "bytes": 27650080
+    },
+    {
+      "id": "kai",
+      "name": "全力 カイ",
+      "url": "https://tts-models.zenryoku.work/v1.3.0/kai.ztm",
+      "sha256": "1c9bbd2113900262b8f74dfcfafe2e61fd3a7cf184b91d76edcd96dd4ff6444a",
+      "bytes": 27650016
+    },
+    {
+      "id": "kikka",
+      "name": "全力 キッカ",
+      "url": "https://tts-models.zenryoku.work/v1.3.0/kikka.ztm",
+      "sha256": "81f3068e883f83ac5c0e7a84b6e0b06ca6ef1f0de05e7a136d94bed18845437b",
+      "bytes": 27650080
+    }
+  ]
+}
