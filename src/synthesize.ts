@@ -148,7 +148,7 @@ export const renderAudio = async (o: {
   }
   parts.push(silence(p.trailingSilenceMs, sr));
   const pcm = applyGain(concat(parts), p.volume);
-  const audio = await encode(pcm, sr, { format: p.format, sampleRate: p.sampleRate, bitrate: p.bitrate, ffmpeg: o.ffmpeg });
+  const audio = await encode(pcm, sr, { format: p.format, sampleRate: p.sampleRate, bitrate: p.bitrate, ffmpeg: o.ffmpeg, signal: o.signal });
   return { audio, durationMs: samplesToMs(pcm.length, sr), sampleRate: outputSampleRate(p.format, p.sampleRate) };
 };
 
@@ -196,7 +196,8 @@ export class Synthesizer {
   /** POST /v1/normalize */
   normalize(raw: unknown): Prepared & { text: string } {
     const req = this.validate(raw);
-    const p = prepareText(req, this.d.dictionary);
+    const limit = this.d.engines.get(req.engine)!.sentenceCharLimit?.(req.options) ?? Infinity;
+    const p = prepareText({ ...req, maxSentenceChars: Math.min(req.maxSentenceChars, limit) }, this.d.dictionary);
     return { text: req.text, ...p };
   }
 
@@ -210,8 +211,8 @@ export class Synthesizer {
     return rec;
   }
 
-  /** POST /v1/synthesize */
-  async synthesize(raw: unknown): Promise<SynthResult> {
+  /** POST /v1/synthesize。signal はクライアントの切断（待ち行列・エンジン・ffmpeg まで届く。合流中は全員が切断したときだけ止める） */
+  async synthesize(raw: unknown, signal?: AbortSignal): Promise<SynthResult> {
     const req = this.validate(raw);
     const engine = this.d.engines.get(req.engine)!;
     const voice = this.resolveVoice(engine, req.voice);
@@ -247,15 +248,19 @@ export class Synthesizer {
     }
 
     // キャッシュを使わない要求は合流しない（毎回作る）
-    const { promise } = this.d.queue.run(useCache ? key : undefined, async () => {
+    // 待ち行列での待ちも timeoutSec まで（要求全体のタイムアウトは実行が始まってから数える）
+    const { promise } = this.d.queue.run(useCache ? key : undefined, async stop => {
       const started = performance.now();
       const ac = new AbortController();
       const timer = setTimeout(
         () => ac.abort(new ApiError(504, 'timeout', `synthesis took longer than ${this.d.timeoutSec}s`)),
         this.d.timeoutSec * 1000,
       );
+      const jobSignal = AbortSignal.any([ac.signal, stop]);
       try {
-        const r = await renderAudio({ engine, voice, sentences, params, options: req.options, signal: ac.signal, ffmpeg: this.d.ffmpeg });
+        const r = await renderAudio({ engine, voice, sentences, params, options: req.options, signal: jobSignal, ffmpeg: this.d.ffmpeg });
+        // 中断された合成はキャッシュに書かない
+        if (jobSignal.aborted) throw jobSignal.reason;
         const synthesisMs = Math.round(performance.now() - started);
         if (useCache) {
           await this.d.cache
@@ -266,7 +271,7 @@ export class Synthesizer {
       } finally {
         clearTimeout(timer);
       }
-    });
+    }, { signal, waitTimeoutMs: this.d.timeoutSec * 1000 });
     const r = await promise;
     return {
       audio: r.audio, contentType, engine, voice: voice.id, durationMs: r.durationMs, sampleRate: r.sampleRate,

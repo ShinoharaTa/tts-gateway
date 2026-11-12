@@ -34,7 +34,19 @@ const OPUS_RATES = new Set([8000, 12000, 16000, 24000, 48000]);
 export const outputSampleRate = (format: Format, sampleRate: number): number =>
   format === 'opus' && !OPUS_RATES.has(sampleRate) ? 48000 : sampleRate;
 
-export type EncodeOptions = { format: Format; sampleRate: number; bitrate?: string; ffmpeg: string };
+/** ffmpeg 1 回の上限（ms）。超えたら kill して 503 */
+export const FFMPEG_TIMEOUT_MS = 30_000;
+
+export type EncodeOptions = {
+  format: Format;
+  sampleRate: number;
+  bitrate?: string;
+  ffmpeg: string;
+  /** abort されたら ffmpeg を kill し、signal.reason で失敗する */
+  signal?: AbortSignal;
+  /** ffmpeg の上限（既定 FFMPEG_TIMEOUT_MS。テスト用） */
+  timeoutMs?: number;
+};
 
 const CODEC_ARGS: Record<Format, (bitrate?: string) => string[]> = {
   wav: () => ['-c:a', 'pcm_s16le', '-f', 'wav'],
@@ -130,6 +142,7 @@ export class FfmpegProbe {
 export const encode = async (pcm: Float32Array, inputRate: number, o: EncodeOptions): Promise<Buffer> => {
   const rate = outputSampleRate(o.format, o.sampleRate);
   if (!needsFfmpeg(o.format, o.sampleRate, inputRate)) return wavBuffer(pcm, inputRate);
+  if (o.signal?.aborted) throw o.signal.reason;
   const dir = await mkdtemp(join(tmpdir(), 'tts-gateway-enc-'));
   const out = join(dir, `out.${EXTENSIONS[o.format]}`);
   try {
@@ -137,14 +150,19 @@ export const encode = async (pcm: Float32Array, inputRate: number, o: EncodeOpti
       '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
       '-f', 's16le', '-ar', String(inputRate), '-ac', '1', '-i', 'pipe:0',
       '-ar', String(rate), '-ac', '1', ...CODEC_ARGS[o.format](o.bitrate), out,
-    ], toS16(pcm));
+    ], toS16(pcm), o.signal, o.timeoutMs ?? FFMPEG_TIMEOUT_MS);
     return await readFile(out);
   } finally {
+    // 成功・失敗・abort・タイムアウトのどれでも消す（kill した場合も終了を待ってから来る）
     await rm(dir, { recursive: true, force: true });
   }
 };
 
-const runFfmpeg = (ffmpeg: string, args: string[], input: Buffer): Promise<void> =>
+/**
+ * ffmpeg を 1 回動かす。abort・タイムアウトでは SIGKILL し、終了（'exit'）を待ってから失敗する。
+ * 'close' は孫プロセスが stdio を握っていると来ないことがあるので、kill した後は待たない
+ */
+const runFfmpeg = (ffmpeg: string, args: string[], input: Buffer, signal: AbortSignal | undefined, timeoutMs: number): Promise<void> =>
   new Promise((resolve, reject) => {
     let proc: ReturnType<typeof spawn>;
     try {
@@ -154,22 +172,60 @@ const runFfmpeg = (ffmpeg: string, args: string[], input: Buffer): Promise<void>
       reject(ffmpegUnavailable(ffmpeg));
       return;
     }
+    let settled = false;
+    /** kill した理由。決まったら 'exit' でこれを返す */
+    let killedWith: unknown;
+    const settle = (e?: unknown): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      if (e === undefined) resolve();
+      else reject(e);
+    };
+    const kill = (reason: unknown): void => {
+      if (settled || killedWith !== undefined) return;
+      killedWith = reason;
+      proc.stderr!.destroy();
+      proc.kill('SIGKILL');
+      // 既に終わっていれば 'exit' は来ない
+      if (proc.exitCode !== null || proc.signalCode !== null) settle(reason);
+    };
+    const onAbort = (): void => kill(signal!.reason);
+    const timer = setTimeout(
+      () => kill(new ApiError(503, 'engine_unavailable', `ffmpeg (${ffmpeg}) timed out after ${Math.round(timeoutMs / 1000)}s`)),
+      timeoutMs,
+    );
+    signal?.addEventListener('abort', onAbort, { once: true });
+
     let stderr = '';
     proc.stderr!.on('data', (d: Buffer) => {
       if (stderr.length < 4000) stderr += d.toString();
     });
+    proc.stderr!.on('error', () => {});
+    // 常設（settle 後に来ても未処理の 'error' にしない）
     proc.on('error', (e: NodeJS.ErrnoException) =>
-      reject(
-        START_ERRORS.has(e.code ?? '')
-          ? ffmpegUnavailable(ffmpeg)
-          : new Error(`ffmpeg (${ffmpeg}) failed to start: ${e.message}`),
+      settle(
+        killedWith ??
+          (START_ERRORS.has(e.code ?? '')
+            ? ffmpegUnavailable(ffmpeg)
+            : new Error(`ffmpeg (${ffmpeg}) failed to start: ${e.message}`)),
       ),
     );
+    proc.on('exit', () => {
+      if (killedWith !== undefined) settle(killedWith);
+    });
     proc.on('close', code =>
-      code === 0
-        ? resolve()
-        : reject(code === NOT_FOUND_EXIT ? ffmpegUnavailable(ffmpeg) : new Error(`ffmpeg exited ${code}: ${stderr.trim()}`)),
+      settle(
+        killedWith ??
+          (code === 0
+            ? undefined
+            : code === NOT_FOUND_EXIT
+              ? ffmpegUnavailable(ffmpeg)
+              : new Error(`ffmpeg exited ${code}: ${stderr.trim()}`)),
+      ),
     );
     proc.stdin!.on('error', () => {});
     proc.stdin!.end(input);
+    if (signal?.aborted) onAbort();
   });

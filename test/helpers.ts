@@ -17,7 +17,7 @@ export const tempDir = async (): Promise<{ dir: string; cleanup: () => Promise<v
 
 /**
  * 偽のエンジン。1 文につき「前 pad 個の無音 + 文字数 × perChar 個の 0.5 + 後 pad 個の無音」を返す。
- * calls に合成した文を記録する。delayMs で合成に時間をかけられる
+ * calls に合成した文、signals に渡された signal を記録する。delayMs で合成に時間をかけられる
  */
 export class FakeEngine implements Engine {
   id: string;
@@ -28,6 +28,7 @@ export class FakeEngine implements Engine {
   modelExt = '.fake';
   optionsKey: string;
   calls: { sentence: string; voice: string; opts: Record<string, unknown> }[] = [];
+  signals: AbortSignal[] = [];
   delayMs = 0;
   pad = 80;
   perChar = 10;
@@ -65,6 +66,7 @@ export class FakeEngine implements Engine {
 
   async synthesize(sentence: string, voice: ModelRecord, opts: Record<string, unknown>, signal: AbortSignal): Promise<Float32Array> {
     this.calls.push({ sentence, voice: voice.id, opts });
+    this.signals.push(signal);
     if (this.delayMs) {
       await new Promise<void>((resolve, reject) => {
         const t = setTimeout(resolve, this.delayMs);

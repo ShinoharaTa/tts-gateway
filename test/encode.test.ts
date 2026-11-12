@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
-import { chmod, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { encode, FfmpegProbe, needsFfmpeg, probeFfmpeg } from '../src/audio/encode.ts';
+import { encode, FFMPEG_TIMEOUT_MS, FfmpegProbe, needsFfmpeg, probeFfmpeg } from '../src/audio/encode.ts';
 import { ApiError } from '../src/errors.ts';
 import { tempDir } from './helpers.ts';
 
@@ -91,6 +91,93 @@ test('FfmpegProbe: 30 秒以内は前回の結果、過ぎたら probe し直す
     // 直後は probe しない
     await probe.get();
     assert.equal((await readFile(log, 'utf8')).split('\n').filter(Boolean).length, 1);
+  } finally {
+    await cleanup();
+  }
+});
+
+/** 出力（最後の引数）を書きかけてからハングする偽の ffmpeg。exec でなければ sh の子の sleep が stdio を握ったまま残る */
+const hangingFfmpeg = async (dir: string, exec: boolean): Promise<string> => {
+  const fake = join(dir, exec ? 'hang-exec' : 'hang-child');
+  await writeFile(fake, `#!/bin/sh\nfor a; do out="$a"; done\necho partial > "$out"\n${exec ? 'exec sleep 30' : 'sleep 3'}\n`);
+  await chmod(fake, 0o755);
+  return fake;
+};
+
+/** encode の一時ディレクトリを dir の下に作らせる（os.tmpdir() は TMPDIR を見る） */
+const withTmpdir = async <T>(dir: string, fn: () => Promise<T>): Promise<T> => {
+  const prev = process.env.TMPDIR;
+  process.env.TMPDIR = dir;
+  try {
+    return await fn();
+  } finally {
+    if (prev === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = prev;
+  }
+};
+
+const encDirs = async (dir: string): Promise<string[]> => (await readdir(dir)).filter(n => n.startsWith('tts-gateway-enc-'));
+
+test('encode: ハングした ffmpeg は abort で kill し、signal.reason で失敗する。一時ディレクトリは残らない', async () => {
+  const { dir, cleanup } = await tempDir();
+  try {
+    const tmp = join(dir, 'tmp');
+    await mkdir(tmp);
+    for (const exec of [true, false]) {
+      const ffmpeg = await hangingFfmpeg(dir, exec);
+      const ac = new AbortController();
+      const reason = new Error('client disconnected');
+      const started = Date.now();
+      const p = withTmpdir(tmp, () => encode(pcm, 8000, { format: 'mp3', sampleRate: 8000, ffmpeg, signal: ac.signal }));
+      await new Promise(r => setTimeout(r, 200));
+      assert.equal((await encDirs(tmp)).length, 1);
+      ac.abort(reason);
+      await assert.rejects(p, (e: unknown) => e === reason);
+      // 孫プロセスが stdio を握っていても待たない
+      assert.ok(Date.now() - started < 2000, `took ${Date.now() - started}ms`);
+      assert.deepEqual(await encDirs(tmp), []);
+    }
+    // 始める前に abort 済みなら起動しない
+    const ac = new AbortController();
+    ac.abort(new Error('already'));
+    await assert.rejects(
+      withTmpdir(tmp, () => encode(pcm, 8000, { format: 'mp3', sampleRate: 8000, ffmpeg: join(dir, 'missing'), signal: ac.signal })),
+      /already/,
+    );
+    assert.deepEqual(await encDirs(tmp), []);
+  } finally {
+    await cleanup();
+  }
+});
+
+test('encode: タイムアウトを超えた ffmpeg は kill して 503 engine_unavailable（timed out）。成功・失敗でも一時ディレクトリは残らない', async () => {
+  const { dir, cleanup } = await tempDir();
+  try {
+    const tmp = join(dir, 'tmp');
+    await mkdir(tmp);
+    assert.equal(FFMPEG_TIMEOUT_MS, 30_000);
+    const ffmpeg = await hangingFfmpeg(dir, true);
+    await assert.rejects(
+      withTmpdir(tmp, () => encode(pcm, 8000, { format: 'opus', sampleRate: 8000, ffmpeg, timeoutMs: 300 })),
+      (e: unknown) => {
+        assert.ok(e instanceof ApiError);
+        assert.equal(e.status, 503);
+        assert.equal(e.code, 'engine_unavailable');
+        assert.match(e.message, /timed out/);
+        return true;
+      },
+    );
+    assert.deepEqual(await encDirs(tmp), []);
+    // 成功（入力を読み、出力を書いて 0 で終わる）
+    const ok = join(dir, 'ok');
+    await writeFile(ok, '#!/bin/sh\nfor a; do out="$a"; done\ncat > /dev/null\necho done > "$out"\n');
+    await chmod(ok, 0o755);
+    const out = await withTmpdir(tmp, () => encode(pcm, 8000, { format: 'mp3', sampleRate: 8000, ffmpeg: ok, timeoutMs: 5000 }));
+    assert.equal(out.toString(), 'done\n');
+    assert.deepEqual(await encDirs(tmp), []);
+    // 失敗（非 0 終了）
+    await assert.rejects(withTmpdir(tmp, () => encode(pcm, 8000, { format: 'mp3', sampleRate: 8000, ffmpeg: 'false' })), /ffmpeg exited 1/);
+    assert.deepEqual(await encDirs(tmp), []);
   } finally {
     await cleanup();
   }

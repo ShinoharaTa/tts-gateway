@@ -333,7 +333,22 @@ const routes: Route[] = [
   {
     method: 'POST', re: /^\/v1\/synthesize$/, admin: false, auth: true,
     run: async (app, req, res) => {
-      const r = await app.synth.synthesize(await readJson(req));
+      // 応答を返し終える前に接続が閉じたら合成を止める（合流中なら全員が切断したときだけ止まる）
+      const ac = new AbortController();
+      const onClose = (): void => {
+        if (!res.writableFinished) ac.abort(new Error('client disconnected'));
+      };
+      res.on('close', onClose);
+      const r = await app.synth.synthesize(await readJson(req), ac.signal).catch((e: unknown) => {
+        if (!ac.signal.aborted) throw e;
+        return null;
+      });
+      if (!r || ac.signal.aborted) {
+        // 切断した要求には応答を書かない（エラー扱いにしない）
+        console.log(`${req.method} ${req.url}: client disconnected before the response`);
+        return;
+      }
+      res.off('close', onClose);
       res.writeHead(200, {
         ...SECURITY_HEADERS,
         'Content-Type': r.contentType,
