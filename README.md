@@ -25,7 +25,7 @@ Engines are pluggable; the first one is [ZEN-TTS](https://github.com/zenryokukik
 
 ## Quick start
 
-Requires Node.js 26.12.1 or later, and ffmpeg for formats other than wav.
+Requires Node.js 26.12.1 or later. ffmpeg is needed for formats other than wav, and for changing the sample rate.
 
 ```sh
 git clone https://github.com/ShinoharaTa/tts-gateway.git

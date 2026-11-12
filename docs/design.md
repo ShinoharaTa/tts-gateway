@@ -21,8 +21,8 @@ src/
   errors.ts           # ApiError(status, code, message, field?)
   validate.ts         # リクエストの検証（未知フィールドは 400）
   synthesize.ts       # 前処理 → 辞書 → 文分割 → エンジン → 無音処理・連結 → エンコード
-  text/spoken.ts      # 記号の読み替え（signal-digest-tts の spoken.ts と同じ規則）
-  text/readings.ts    # 読み辞書（signal-digest-tts の readings.ts の compile/apply/hits/unknownWords と同じ規則。DB 部分は無し）
+  text/spoken.ts      # 記号の読み替え
+  text/readings.ts    # 読み辞書（コンパイル・適用・当たった語・未知語の抽出）
   audio/pcm.ts        # trimSilence・無音・音量・連結・WAV 書き出し
   audio/encode.ts     # ffmpeg で各形式へ
   queue.ts            # 同時実行数・待ち行列上限・同一キーの合流
@@ -53,13 +53,18 @@ test/*.test.ts
 
 ```ts
 interface Engine {
-  id: string; name: string; version: string; sampleRate: number;
-  credit: { ja: string; en: string; url: string };
-  modelExt: string;                        // '.ztm'
-  optionsKey: string;                      // リクエストの固有オプションのキー（'zenTts'）
-  voices(): VoiceInfo[];                   // registry のインストール済みモデルから
-  validateOptions(raw: unknown): EngineOptions;   // 範囲外・未知は ApiError 400
-  verifyModel(path: string): Promise<{ voiceId: string }>;  // 取得後の検査
+  id: string;
+  name: string;
+  version: string;
+  sampleRate: number;
+  credit: Credit;
+  modelExt: string;                    // '.ztm'
+  optionsKey: string;                  // リクエストの固有オプションのキー（'zenTts'）
+  describe(): Record<string, unknown>; // GET /v1/engines の追加の項目（options・emotions など）
+  voices(): VoiceInfo[];               // registry の登録済みモデルから
+  validateOptions(raw: unknown): EngineOptions;  // 範囲外・未知は ApiError 400
+  sentenceCharLimit?(opts: EngineOptions): number;  // 1 文の最大字数（省略時は制限なし）
+  verifyModel(path: string): Promise<{ voiceId: string }>;  // 取得後の検査。読めなければ例外
   synthesize(sentence: string, voice: ModelRecord, opts: EngineOptions, signal: AbortSignal): Promise<Float32Array>;
   status(): EngineStatus;
   close(): Promise<void>;
@@ -86,6 +91,6 @@ interface Engine {
 - `TTS_ADMIN_TOKEN` / `TTS_TOKEN` があるときは画面でトークンを入力し、`localStorage` に保存して `Authorization` に付ける。
 - 外部 CDN を使わない（全部 public/ に置く）。
 
-## systemd（--user、有効化はユーザーの確認後）
+## systemd（--user）
 
 `Nice=10` `CPUQuota=150%` `MemoryHigh=600M` `MemoryMax=800M`、`EnvironmentFile=%h/.config/tts-gateway/env`（ホスト・許可 CIDR・トークン。リポジトリに入れない）。
