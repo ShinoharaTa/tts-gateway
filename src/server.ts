@@ -9,6 +9,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFile, rm } from 'node:fs/promises';
 import type { IncomingMessage, RequestListener, ServerResponse } from 'node:http';
 import { join } from 'node:path';
+import { FfmpegProbe } from './audio/encode.ts';
 import { AudioCache } from './cache.ts';
 import { VERSION, type Config } from './config.ts';
 import { createEngines, MODEL_EXTS, type EngineDeps } from './engines/index.ts';
@@ -35,6 +36,8 @@ export type App = {
   catalog: CatalogModel[];
   downloader: ModelDownloader;
   synth: Synthesizer;
+  /** ffmpeg の有無（30 秒たてば確かめ直す） */
+  ffmpeg: FfmpegProbe;
   startedAt: number;
   close: () => Promise<void>;
 };
@@ -68,9 +71,12 @@ export const createApp = async (config: Config, o: AppOverrides = {}): Promise<A
     isHostAllowed: o.isHostAllowed,
     protocols: o.protocols,
   });
+  // ffmpeg が無くても起動は続ける（wav はそのまま返せる）
+  const ffmpeg = new FfmpegProbe(config.ffmpeg);
+  await ffmpeg.get();
   const synth = new Synthesizer({
     engines, registry, settings, cache, queue, dictionary,
-    maxChars: config.maxChars, timeoutSec: config.timeoutSec, ffmpeg: config.ffmpeg,
+    maxChars: config.maxChars, timeoutSec: config.timeoutSec, ffmpeg: config.ffmpeg, ffmpegProbe: ffmpeg,
   });
   settings.onChange(() => {
     void cache.evict().catch(e => console.error(`cache evict failed: ${(e as Error).message}`));
@@ -84,7 +90,7 @@ export const createApp = async (config: Config, o: AppOverrides = {}): Promise<A
     await downloader.cancelAll();
     await Promise.all([...engines.values()].map(e => e.close()));
   };
-  return { config, engines, registry, settings, cache, queue, dictionary, catalog, downloader, synth, startedAt: Date.now(), close };
+  return { config, engines, registry, settings, cache, queue, dictionary, catalog, downloader, synth, ffmpeg, startedAt: Date.now(), close };
 };
 
 // ---- 入出力 ----
@@ -213,12 +219,13 @@ const enginesJson = (app: App): unknown => {
   };
 };
 
-const statusJson = (app: App): unknown => ({
+const statusJson = async (app: App): Promise<unknown> => ({
   version: VERSION,
   uptimeSec: Math.floor((Date.now() - app.startedAt) / 1000),
   engines: [...app.engines.values()].map(e => e.status()),
   queue: app.queue.stats(),
   cache: app.cache.stats(),
+  ffmpeg: await app.ffmpeg.get(),
   memory: { rssBytes: process.memoryUsage.rss() },
 });
 
@@ -326,7 +333,22 @@ const routes: Route[] = [
   {
     method: 'POST', re: /^\/v1\/synthesize$/, admin: false, auth: true,
     run: async (app, req, res) => {
-      const r = await app.synth.synthesize(await readJson(req));
+      // 応答を返し終える前に接続が閉じたら合成を止める（合流中なら全員が切断したときだけ止まる）
+      const ac = new AbortController();
+      const onClose = (): void => {
+        if (!res.writableFinished) ac.abort(new Error('client disconnected'));
+      };
+      res.on('close', onClose);
+      const r = await app.synth.synthesize(await readJson(req), ac.signal).catch((e: unknown) => {
+        if (!ac.signal.aborted) throw e;
+        return null;
+      });
+      if (!r || ac.signal.aborted) {
+        // 切断した要求には応答を書かない（エラー扱いにしない）
+        console.log(`${req.method} ${req.url}: client disconnected before the response`);
+        return;
+      }
+      res.off('close', onClose);
       res.writeHead(200, {
         ...SECURITY_HEADERS,
         'Content-Type': r.contentType,
@@ -361,7 +383,7 @@ const routes: Route[] = [
     method: 'GET', re: /^\/v1\/admin\/status$/, admin: true, auth: true,
     run: async (app, req, res) => {
       await noBody(req);
-      sendJson(res, 200, statusJson(app));
+      sendJson(res, 200, await statusJson(app));
     },
   },
   {
