@@ -35,5 +35,5 @@ journalctl --user -u tts-gateway -f
 - **接続元**: `TTS_ALLOW_CIDRS` に入らない接続元は 403。外からの接続を許すなら範囲をできるだけ狭くしてください。
 - **トークン**: ループバック以外から使うなら `TTS_TOKEN` と `TTS_ADMIN_TOKEN` を設定してください。`TTS_ADMIN_TOKEN` は管理 API（モデルの追加・削除・辞書・設定）だけを守ります。
 - **CSRF**: CORS ヘッダを返さず、本文は JSON だけを受け付けます（別オリジンのページからの要求を防ぐため）。
-- **モデルの取得**: `https` で `TTS_MODEL_HOSTS` のホストだけ（リダイレクト先も検査）、上限 `TTS_MODEL_MAX_MB`、sha256 の検査、エンジンでの読み込み検査を通ったものだけ使います。
+- **モデルの取得**: `https`・ポート 443 で `TTS_MODEL_HOSTS` のホストだけ（リダイレクト先も検査、最大 5 回）、上限 `TTS_MODEL_MAX_MB`・`TTS_MODEL_TIMEOUT_SEC`（無通信は 30 秒）、sha256 の検査、エンジンでの読み込み検査を通ったものだけ使います。
 - **TLS**: 終端しません。ネットワーク越しに使うときは VPN（Tailscale など）かリバースプロキシの内側に置いてください。

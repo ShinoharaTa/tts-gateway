@@ -16,7 +16,7 @@ import type { Engine } from './engines/types.ts';
 import { ApiError, conflict, invalid, notFound } from './errors.ts';
 import { loadCatalog, type CatalogModel } from './models/catalog.ts';
 import { ModelDownloader } from './models/download.ts';
-import { MODEL_ID_RE, Registry, type ModelRecord } from './models/registry.ts';
+import { MAX_MODELS, MODEL_ID_RE, Registry, type ModelRecord } from './models/registry.ts';
 import { isAllowed } from './net.ts';
 import { SynthQueue } from './queue.ts';
 import { SettingsStore, validateSettingsPatch } from './settings.ts';
@@ -42,9 +42,10 @@ export type App = {
 export type AppOverrides = {
   /** テスト用: 偽のエンジン */
   engines?: (deps: EngineDeps) => Map<string, Engine>;
-  /** テスト用: モデル取得のホスト判定と許可するスキーム */
+  /** テスト用: モデル取得のホスト判定・許可するスキーム・ポート判定 */
   isHostAllowed?: (host: string) => boolean;
   protocols?: readonly string[];
+  isPortAllowed?: (port: number) => boolean;
 };
 
 export const createApp = async (config: Config, o: AppOverrides = {}): Promise<App> => {
@@ -65,8 +66,10 @@ export const createApp = async (config: Config, o: AppOverrides = {}): Promise<A
     engines,
     modelHosts: config.modelHosts,
     maxBytes: config.modelMaxBytes,
+    timeoutMs: config.modelTimeoutSec * 1000,
     isHostAllowed: o.isHostAllowed,
     protocols: o.protocols,
+    isPortAllowed: o.isPortAllowed,
   });
   const synth = new Synthesizer({
     engines, registry, settings, cache, queue, dictionary,
@@ -267,9 +270,18 @@ const addModel = async (app: App, raw: unknown): Promise<ModelRecord> => {
     };
   }
   app.downloader.validateUrl(rec.source.url, body.catalog !== undefined ? 'catalog' : 'url');
+  if (app.registry.list().length >= MAX_MODELS) throw invalid(`too many models (up to ${MAX_MODELS})`);
+  if (app.downloader.isDeleting(engineId, rec.id)) throw conflict(`model ${rec.id} of ${engineId} is being deleted`, 'id');
   if (app.registry.get(engineId, rec.id)) throw conflict(`model ${rec.id} of ${engineId} already exists`, 'id');
+  app.downloader.checkCapacity();
   await app.registry.add(rec);
-  await app.downloader.start(rec);
+  try {
+    await app.downloader.start(rec);
+  } catch (e) {
+    // 始められなければ（同時取得の上限など）登録しない
+    await app.registry.remove(engineId, rec.id);
+    throw e;
+  }
   return rec;
 };
 
@@ -278,11 +290,13 @@ const deleteModel = async (app: App, engineId: string, id: string): Promise<void
   const rec = app.registry.get(engineId, id);
   if (!engine || !rec) throw notFound(`model ${id} of ${engineId} not found`);
   if (app.settings.get().defaultVoices[engineId] === id) throw conflict(`model ${id} is the default voice of ${engineId}`);
-  await app.downloader.cancel(engineId, id);
-  const path = app.registry.modelPath(engineId, id, engine.modelExt);
-  await rm(path, { force: true });
-  await rm(`${path}.part`, { force: true });
-  await app.registry.remove(engineId, id);
+  // 取得中なら止めて .part が消えるのを待ってから消す。その間の同じ id の追加・取り直しは 409
+  await app.downloader.remove(engineId, id, async () => {
+    const path = app.registry.modelPath(engineId, id, engine.modelExt);
+    await rm(path, { force: true });
+    await rm(`${path}.part`, { force: true });
+    await app.registry.remove(engineId, id);
+  });
 };
 
 const decodeSegment = (s: string): string => {
@@ -408,6 +422,7 @@ const routes: Route[] = [
       const [engineId, id] = [decodeSegment(m[1]!), decodeSegment(m[2]!)];
       const rec = app.registry.get(engineId, id);
       if (!rec) throw notFound(`model ${id} of ${engineId} not found`);
+      if (app.downloader.isDeleting(engineId, id)) throw conflict(`model ${id} is being deleted`);
       if (rec.status !== 'pending' && rec.status !== 'error') throw conflict(`model ${id} is ${rec.status}`);
       await app.downloader.start(rec);
       sendJson(res, 202, rec);

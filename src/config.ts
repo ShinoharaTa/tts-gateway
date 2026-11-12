@@ -27,6 +27,8 @@ export type Config = {
   timeoutSec: number;
   modelHosts: string[];
   modelMaxBytes: number;
+  /** モデル 1 件のダウンロードの上限（秒） */
+  modelTimeoutSec: number;
   ffmpeg: string;
   packageDir: string;
 };
@@ -84,6 +86,7 @@ export const loadConfig = (env: Env = process.env): Config => {
     timeoutSec: int(env, 'TTS_TIMEOUT_SEC', 60, 1, 3600),
     modelHosts,
     modelMaxBytes: int(env, 'TTS_MODEL_MAX_MB', 512, 1, 100_000) * 1024 * 1024,
+    modelTimeoutSec: int(env, 'TTS_MODEL_TIMEOUT_SEC', 600, 10, 86400),
     ffmpeg: env.FFMPEG || 'ffmpeg',
     packageDir: PACKAGE_DIR,
   };

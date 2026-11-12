@@ -17,6 +17,7 @@
 | `TTS_TIMEOUT_SEC` | `60` | 1 要求の合成の上限（秒）。超えたら 504 |
 | `TTS_MODEL_HOSTS` | `tts-models.zenryoku.work,huggingface.co,hf.co` | モデルを取得してよいホスト（サブドメインも可。リダイレクト先も検査） |
 | `TTS_MODEL_MAX_MB` | `512` | モデルの大きさの上限（MB） |
+| `TTS_MODEL_TIMEOUT_SEC` | `600` | モデル 1 件のダウンロードの上限（秒、10〜86400）。超えたら失敗。別に無通信 30 秒でも失敗 |
 | `FFMPEG` | `ffmpeg` | ffmpeg のパス |
 
 例は [`.env.example`](../.env.example)。
