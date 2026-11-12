@@ -317,3 +317,68 @@ test('ffmpeg が probe の後に消えた: mp3 は 500 ではなく 503 engine_u
     await cleanup();
   }
 });
+
+/** 条件が満たされるまで待つ（最大 2 秒） */
+const until = async (cond: () => boolean): Promise<void> => {
+  for (let i = 0; i < 200 && !cond(); i++) await new Promise(r => setTimeout(r, 10));
+  assert.ok(cond());
+};
+
+test('synthesize: 合成中に接続を切るとエンジンの signal が abort され、キャッシュに書かない', async () => {
+  const c = await start();
+  try {
+    c.engine.delayMs = 1000;
+    const ac = new AbortController();
+    const res = fetch(`${c.base}/v1/synthesize`, { ...json({ text: 'こんにちは。' }), signal: ac.signal });
+    await until(() => c.engine.signals.length === 1);
+    ac.abort();
+    await assert.rejects(res);
+    await until(() => c.engine.signals[0]!.aborted);
+    await until(() => c.app.queue.stats().running === 0);
+    c.engine.delayMs = 0;
+    const r = await fetch(`${c.base}/v1/synthesize`, json({ text: 'こんにちは。' }));
+    assert.equal(r.status, 200);
+    assert.equal(r.headers.get('x-cache'), 'miss');
+  } finally {
+    await c.stop();
+  }
+});
+
+test('synthesize: 合流中は 1 人が切断しても合成を続け、残った要求に返す。全員が切断したら止める', async () => {
+  const c = await start();
+  try {
+    c.engine.delayMs = 300;
+    const body = json({ text: 'こんにちは。' });
+    const ac = new AbortController();
+    const gone = fetch(`${c.base}/v1/synthesize`, { ...body, signal: ac.signal });
+    await until(() => c.engine.signals.length === 1);
+    const stay = fetch(`${c.base}/v1/synthesize`, body);
+    // 合流するまで待ってから切る
+    await new Promise(r => setTimeout(r, 50));
+    ac.abort();
+    await assert.rejects(gone);
+    const r = await stay;
+    assert.equal(r.status, 200);
+    assert.equal(r.headers.get('x-cache'), 'miss');
+    assert.equal(c.engine.calls.length, 1);
+    assert.equal(c.engine.signals[0]!.aborted, false);
+
+    // 全員が切断
+    c.engine.delayMs = 1000;
+    const body2 = json({ text: 'さようなら。' });
+    const acs = [new AbortController(), new AbortController()];
+    // 切った方の reject を待つ間に未処理にしない
+    const both = acs.map(a => fetch(`${c.base}/v1/synthesize`, { ...body2, signal: a.signal }).then(() => 'ok', () => 'aborted'));
+    await until(() => c.engine.signals.length === 2);
+    await new Promise(r => setTimeout(r, 50));
+    acs[0]!.abort();
+    await new Promise(r => setTimeout(r, 50));
+    assert.equal(c.engine.signals[1]!.aborted, false);
+    acs[1]!.abort();
+    assert.deepEqual(await Promise.all(both), ['aborted', 'aborted']);
+    await until(() => c.engine.signals[1]!.aborted);
+    assert.equal(c.engine.calls.length, 2);
+  } finally {
+    await c.stop();
+  }
+});
