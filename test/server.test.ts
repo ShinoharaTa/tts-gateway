@@ -153,8 +153,11 @@ test('normalize と辞書', async () => {
     assert.equal(r.status, 200);
     const all = (await (await fetch(`${c.base}/v1/dictionary`)).json()) as { entries: { surface: string; reading: string; source: string }[] };
     assert.deepEqual(all.entries.find(e => e.surface === 'GitHub'), { surface: 'GitHub', reading: 'ギッハブ', source: 'user' });
-    // 読みの形・頭字語・未知のフィールド
-    for (const [surface, body] of [['Bar', { reading: 'ばー' }], ['API', { reading: 'エーピーアイ' }], ['Bar', { reading: 'バー', x: 1 }]] as const) {
+    // 読みの形（半角カナを含む）・頭字語・# で始まる語・未知のフィールド
+    for (const [surface, body] of [
+      ['Bar', { reading: 'ばー' }], ['Bar', { reading: 'ﾊﾞｰ' }], ['%23Bar', { reading: 'バー' }],
+      ['Bar', { reading: 'バー', x: 1 }],
+    ] as const) {
       r = await fetch(`${c.base}/v1/admin/dictionary/${surface}`, { ...json(body), method: 'PUT' });
       assert.equal(r.status, 400, surface);
     }

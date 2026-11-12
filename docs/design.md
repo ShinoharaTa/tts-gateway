@@ -23,7 +23,7 @@ src/
   net.ts              # CIDR 判定、複数ホストへの listen（EADDRNOTAVAIL は 5 秒ごとに再試行）
   errors.ts           # ApiError(status, code, message, field?)
   validate.ts         # リクエストの検証（未知フィールドは 400）
-  synthesize.ts       # 前処理 → 辞書 → 文分割 → エンジン → 無音処理・連結 → エンコード
+  synthesize.ts       # 前処理の前段（NFKC・URL 削除）→ 辞書 → 前処理の後段（記号の規則）→ 文分割 → エンジン → 無音処理・連結 → エンコード
   text/spoken.ts      # 記号の読み替え（signal-digest-tts の spoken.ts と同じ規則）
   text/readings.ts    # 読み辞書（signal-digest-tts の readings.ts の compile/apply/hits/unknownWords と同じ規則。DB 部分は無し）
   audio/pcm.ts        # trimSilence・無音・音量・連結・WAV 書き出し

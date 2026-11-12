@@ -24,7 +24,7 @@ import { isAllowed, parseIp } from './net.ts';
 import { SynthQueue } from './queue.ts';
 import { SettingsStore, validateSettingsPatch } from './settings.ts';
 import { Synthesizer } from './synthesize.ts';
-import { Dictionary, isAcronym } from './text/readings.ts';
+import { Dictionary } from './text/readings.ts';
 import { checkKeys, checkObject, checkReading, checkString, checkSurface } from './validate.ts';
 
 export type App = {
@@ -372,7 +372,6 @@ const decodeSegment = (s: string): string => {
 
 const putReading = async (app: App, rawSurface: string, raw: unknown): Promise<void> => {
   const surface = checkSurface(rawSurface, 'surface');
-  if (isAcronym(surface)) throw invalid('all-capital words of up to 5 characters are read by ZEN-TTS and cannot be registered', 'surface');
   const body = checkObject(raw, '');
   checkKeys(body, ['reading']);
   if (body.reading === undefined) throw invalid('reading is required', 'reading');
