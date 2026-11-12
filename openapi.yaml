@@ -6,10 +6,14 @@ info:
   description: |
     docs/api.md と同じ内容の機械可読な仕様。食い違いはバグ。
 
-    - リクエスト本文は `application/json` のみ（それ以外は 415）。未知のフィールドは 400。
-    - `TTS_TOKEN` を設定したときだけ、`/healthz` と設定画面（`/admin/`）以外で `Authorization: Bearer <TTS_TOKEN>` が必須。
+    - リクエスト本文は `application/json` のみ（それ以外は 415。JSON を受ける POST / PUT は本文が空でも）。未知のフィールドは 400。本文の上限は 1MB（超えたら 400）。
+    - `TTS_TOKEN` を設定したときだけ、`/healthz` と設定画面（`/admin/`）以外で `Authorization: Bearer <TTS_TOKEN>` が必須（`TTS_ADMIN_TOKEN` でも通る）。
       `/v1/admin/*` は `TTS_ADMIN_TOKEN` を設定したときだけその値が必須（未設定なら `TTS_TOKEN` の規則）。
-    - `TTS_ALLOW_CIDRS` に入らない接続元は 403。CORS ヘッダは返さない。
+      認証はパスの有無より先（トークンが要る構成では、未定義のパス・未対応のメソッドも未認証なら 401）。
+    - `TTS_ALLOW_CIDRS` に入らない接続元は 403（`forbidden`）。CORS ヘッダは返さない。
+    - `Host` が `TTS_HOSTS` の各アドレス:`TTS_PORT`（IPv6 は `[::1]:8710`。ポート 80 ならポート無しも可）・ループバックで待ち受けるときの `localhost:<port>`・`TTS_ALLOWED_HOSTS` のホスト名（ポートは問わない）以外、または無ければ全パスで 421（`misdirected_request`）。
+    - GET / HEAD / OPTIONS 以外で `Origin` があり、その host（ポート含む）が上の Host の許可に入らなければ 403（`forbidden_origin`）。`Origin: null` も 403。
+    - 存在するパスへの未対応メソッドは 405（`method_not_allowed`、`Allow` ヘッダ付き）。解釈できないリクエストターゲット（`GET //` など）は 400（`bad_request`）。
 
     音声合成：ZEN-TTS（https://zenryokukikai.com ）。この API で作った音声を使う側でもクレジットの表示が必要。
   license:
@@ -44,6 +48,20 @@ paths:
                 $ref: '#/components/schemas/Health'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
+    head:
+      operationId: headHealth
+      tags: [health]
+      summary: 死活確認（本文なし。認証不要）
+      security: []
+      responses:
+        '200':
+          description: OK（本文なし）
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/engines:
     get:
       operationId: listEngines
@@ -60,11 +78,16 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/synthesize:
     post:
       operationId: synthesize
       tags: [synthesis]
       summary: テキストを音声にする
+      description: >-
+        応答を受け取る前に接続を切ると合成（待ち行列・エンジン・ffmpeg）を止め、応答もキャッシュも書かない。
+        同じ合成を待つ要求（合流）が残っていれば続ける。待ち行列での待ちが TTS_TIMEOUT_SEC を超えたら 503（Retry-After 付き）。
       requestBody:
         required: true
         content:
@@ -142,8 +165,10 @@ paths:
           $ref: '#/components/responses/TextTooLong'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
         '422':
-          $ref: '#/components/responses/ModelNotInstalled'
+          $ref: '#/components/responses/Unprocessable'
         '429':
           $ref: '#/components/responses/QueueFull'
         '500':
@@ -157,7 +182,7 @@ paths:
       operationId: normalize
       tags: [synthesis]
       summary: 合成せずに、前処理と読み辞書を通した後の文を返す
-      description: リクエストは /v1/synthesize と同じ（音声関係のフィールドも検証する）。
+      description: リクエストは /v1/synthesize と同じ（音声関係のフィールド・zenTts などエンジン固有のオプションも同じ規則で検証する）。sentences は合成と同じく maxSentenceChars とエンジンの上限（ZEN-TTS で zenTts.speed < 1 なら 120 × speed 字）の小さい方で分ける。
       requestBody:
         required: true
         content:
@@ -183,6 +208,8 @@ paths:
           $ref: '#/components/responses/TextTooLong'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/dictionary:
     get:
       operationId: getDictionary
@@ -199,6 +226,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/admin/status:
     get:
       operationId: getStatus
@@ -215,6 +244,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/admin/settings:
     get:
       operationId: getSettings
@@ -231,6 +262,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
     put:
       operationId: updateSettings
       tags: [admin]
@@ -258,6 +291,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/admin/catalog:
     get:
       operationId: getCatalog
@@ -274,6 +309,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/admin/models:
     get:
       operationId: listModels
@@ -290,10 +327,15 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
     post:
       operationId: addModel
       tags: [admin]
       summary: モデルを登録し、ダウンロードを始める（非同期）
+      description: |
+        登録は全エンジンの合計 50 件まで（超える追加は 400）。同時ダウンロードは 2 件まで（超えたら 429、登録しない）。
+        同じ id のモデルがある・その id を削除の処理中なら 409。
       requestBody:
         required: true
         content:
@@ -319,11 +361,16 @@ paths:
           $ref: '#/components/responses/Conflict'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
+        '429':
+          $ref: '#/components/responses/TooManyDownloads'
   /v1/admin/models/{engine}/{id}/download:
     post:
       operationId: redownloadModel
       tags: [admin]
       summary: pending / error のモデルを取り直す
+      description: 同じ id の取得が重なった・削除の処理中なら 409。同時ダウンロードが 2 件なら 429。
       parameters:
         - $ref: '#/components/parameters/Engine'
         - $ref: '#/components/parameters/ModelId'
@@ -344,11 +391,16 @@ paths:
           $ref: '#/components/responses/Conflict'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
+        '429':
+          $ref: '#/components/responses/TooManyDownloads'
   /v1/admin/models/{engine}/{id}:
     delete:
       operationId: deleteModel
       tags: [admin]
       summary: 登録と重みのファイルを消す（ダウンロード中なら中止して消す）
+      description: ダウンロード中なら中止し、途中のファイル（.part）が消えるのを待ってから消す。その間の同じ id の追加・取り直しは 409。
       parameters:
         - $ref: '#/components/parameters/Engine'
         - $ref: '#/components/parameters/ModelId'
@@ -365,6 +417,8 @@ paths:
           $ref: '#/components/responses/Conflict'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/admin/dictionary/{surface}:
     parameters:
       - name: surface
@@ -400,6 +454,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
     delete:
       operationId: deleteReading
       tags: [admin]
@@ -419,6 +475,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/admin/cache:
     delete:
       operationId: clearCache
@@ -433,6 +491,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
 components:
   securitySchemes:
     bearerAuth:
@@ -456,7 +516,7 @@ components:
         pattern: '^[a-z0-9][a-z0-9_-]{0,31}$'
   responses:
     BadRequest:
-      description: パラメータ不正（範囲外・型違い・未知のフィールド・そのエンジンが対応しないオプション）
+      description: パラメータ不正（範囲外・型違い・未知のフィールド・そのエンジンが対応しないオプション・本文が 1MB 超。`invalid_request`）、解釈できないリクエストターゲット（`bad_request`）
       content:
         application/json:
           schema:
@@ -473,7 +533,7 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
     Forbidden:
-      description: 接続元が許可リスト外
+      description: 接続元が許可リスト外（`forbidden`）、GET / HEAD / OPTIONS 以外で Origin が許可外・null（`forbidden_origin`）
       content:
         application/json:
           schema:
@@ -485,25 +545,42 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
     Conflict:
-      description: 同じ id のモデルがある・ダウンロード中・既定の声 など
+      description: 同じ id のモデルがある・ダウンロード中（取得の要求が重なった）・削除の処理中・既定の声 など
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
     TextTooLong:
-      description: text が上限（TTS_MAX_CHARS、既定 2,000 字）を超えた
+      description: text が上限（TTS_MAX_CHARS、既定 2,000 字）を超えた。または前処理と読み辞書を通した後の文が上限の 3 倍（既定 6,000 字）を超えた
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
     UnsupportedMediaType:
-      description: JSON 以外の本文
+      description: JSON 以外の本文（JSON を受ける POST / PUT は本文が空でも）
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
-    ModelNotInstalled:
-      description: 声は登録済みだが重みが未取得
+    MethodNotAllowed:
+      description: パスはあるがメソッドが違う（各操作には書かない。どのパスでも起こる）
+      headers:
+        Allow:
+          description: そのパスで使えるメソッド（例 `GET, HEAD`）
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    MisdirectedRequest:
+      description: Host ヘッダが許可外・無い
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unprocessable:
+      description: 声は登録済みだが重みが未取得（model_not_installed）、または読み上げられない長さの語が含まれる（unprocessable_text）
       content:
         application/json:
           schema:
@@ -520,6 +597,18 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    TooManyDownloads:
+      description: 同時ダウンロードが上限（2 件）。code は queue_full
+      headers:
+        Retry-After:
+          description: 再試行までの秒数（5）
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
     InternalError:
       description: 想定外の失敗
       content:
@@ -527,7 +616,13 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
     EngineUnavailable:
-      description: モデル読み込み・合成プロセスの失敗
+      description: モデル読み込み・合成プロセスの失敗、ffmpeg が無い（ffmpeg の要る形式・サンプルレートのとき）、ffmpeg が 30 秒で終わらない（timed out）、または待ち行列での待ちが TTS_TIMEOUT_SEC を超えた（このときだけ Retry-After 付き）
+      headers:
+        Retry-After:
+          description: 再試行までの秒数（待ち行列での待ちが期限を超えたときだけ）
+          schema:
+            type: integer
+            minimum: 1
       content:
         application/json:
           schema:
@@ -556,13 +651,18 @@ components:
               type: string
               enum:
                 - invalid_request
+                - bad_request
                 - unauthorized
                 - forbidden
+                - forbidden_origin
                 - not_found
+                - method_not_allowed
                 - conflict
+                - misdirected_request
                 - text_too_long
                 - unsupported_media_type
                 - model_not_installed
+                - unprocessable_text
                 - queue_full
                 - internal_error
                 - engine_unavailable
@@ -846,8 +946,8 @@ components:
           description: 出力のサンプルレート（既定はエンジンの値）。opus で 44100・22050 は 48000 で書く
         bitrate:
           type: string
-          pattern: '^(1[6-9]|[2-9][0-9]|[12][0-9]{2}|3[01][0-9]|320)k$'
-          description: 圧縮形式のビットレート（既定 mp3 128k / opus 48k / m4a 64k）。wav・flac では指定すると 400
+          pattern: '^[1-9][0-9]{0,2}k$'
+          description: 圧縮形式のビットレート（既定 mp3 128k / opus 48k / m4a 64k）。範囲は opus 6k〜256k、mp3 8k〜320k、m4a 8k〜320k。範囲外・wav・flac で指定すると 400（field は bitrate）
         volume:
           type: number
           minimum: -20
@@ -886,7 +986,7 @@ components:
           default: true
         readings:
           type: object
-          description: この要求だけの読み辞書の追加・上書き（最大 200 語。読みはカタカナ）
+          description: この要求だけの読み辞書の追加・上書き（最大 200 語。読みはカタカナ。語・読みはそれぞれ 100 字まで）
           maxProperties: 200
           default: {}
           propertyNames:
@@ -894,6 +994,7 @@ components:
             maxLength: 100
           additionalProperties:
             type: string
+            maxLength: 100
             pattern: '^[\p{Script=Katakana}ー・ ]+$'
         cache:
           type: boolean
@@ -979,11 +1080,12 @@ components:
       properties:
         reading:
           type: string
+          maxLength: 100
           pattern: '^[\p{Script=Katakana}ー・ ]+$'
     EngineStatus:
       type: object
       additionalProperties: false
-      required: [id, loaded, kernel, process, idleUnloadSec]
+      required: [id, loaded, kernel, process, processes, idleUnloadSec]
       properties:
         id:
           type: string
@@ -1004,12 +1106,33 @@ components:
                   type: integer
                 rssBytes:
                   type: [integer, 'null']
+        processes:
+          type: array
+          description: スロットごとの合成プロセス（スロット順。プロセスの無いスロットは載らない）
+          items:
+            type: object
+            additionalProperties: false
+            required: [slot, voice, pid, state, rssBytes]
+            properties:
+              slot:
+                type: integer
+                minimum: 0
+              voice:
+                type: string
+                description: このプロセスが読む（starting なら読み込み中の）声
+              pid:
+                type: integer
+              state:
+                type: string
+                enum: [starting, idle, busy]
+              rssBytes:
+                type: [integer, 'null']
         idleUnloadSec:
           type: integer
     Status:
       type: object
       additionalProperties: false
-      required: [version, uptimeSec, engines, queue, cache, memory]
+      required: [version, uptimeSec, engines, queue, cache, ffmpeg, memory]
       properties:
         version:
           type: string
@@ -1046,6 +1169,25 @@ components:
               type: integer
             maxBytes:
               type: integer
+        ffmpeg:
+          type: object
+          additionalProperties: false
+          required: [available, path, version, reason]
+          description: '`-version` を試した結果。起動時に試し、前回から 30 秒以上たっていれば状態取得・ffmpeg の要る要求のときに試し直す。available が false なら ffmpeg の要る要求は 503'
+          properties:
+            available:
+              type: boolean
+            path:
+              type: string
+              description: FFMPEG の値
+            version:
+              type: [string, 'null']
+              description: 出力の 1 行目から取った版
+              examples: ['7.0.2']
+            reason:
+              type: [string, 'null']
+              description: 使えない理由。使えれば null
+              examples: ['spawn /usr/bin/ffmpeg ENOENT']
         memory:
           type: object
           additionalProperties: false
@@ -1214,7 +1356,7 @@ components:
           type: string
           format: uri
           pattern: '^https://'
-          description: ホストは TTS_MODEL_HOSTS のどれか、またはそのサブドメイン（リダイレクト先も同じ）
+          description: ポートは 443 のみ（省略か明示の 443）。ホストは TTS_MODEL_HOSTS のどれか、またはそのサブドメイン（リダイレクト先も同じ。リダイレクトは最大 5 回）
         sha256:
           type: string
           pattern: '^[0-9a-fA-F]{64}$'

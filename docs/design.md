@@ -9,6 +9,9 @@ API の外形は [api.md](api.md)。ここは実装の構成と決めごと。
 - 依存は `zen-tts`（`github:zenryokukikai/zen-tts#v1.3.0`）だけ。HTTP は `node:http`、テストは `node --test`。
 - 圧縮形式（mp3 / opus / m4a / flac）とリサンプルは `ffmpeg`（`FFMPEG` 環境変数、既定は PATH の `ffmpeg`）。
   `wav` で `sampleRate` がエンジンの値と同じなら ffmpeg を使わない。
+  起動時に `ffmpeg -version` を試し、無くても起動は続ける（`/v1/admin/status` の `ffmpeg`、起動ログに 1 行）。
+  状態取得・ffmpeg の要る要求のときに、前回から 30 秒以上たっていれば試し直す（同時に 1 本だけ）。
+  無いとき・起動に失敗したとき（spawn の同期 throw、ENOENT / ENOTDIR / EACCES、終了コード 127）は ffmpeg の要る要求を 503 `engine_unavailable` にする。
 
 ## ディレクトリ
 
@@ -20,7 +23,7 @@ src/
   net.ts              # CIDR 判定、複数ホストへの listen（EADDRNOTAVAIL は 5 秒ごとに再試行）
   errors.ts           # ApiError(status, code, message, field?)
   validate.ts         # リクエストの検証（未知フィールドは 400）
-  synthesize.ts       # 前処理 → 辞書 → 文分割 → エンジン → 無音処理・連結 → エンコード
+  synthesize.ts       # 前処理の前段（NFKC・URL 削除）→ 辞書 → 前処理の後段（記号の規則）→ 文分割 → エンジン → 無音処理・連結 → エンコード
   text/spoken.ts      # 記号の読み替え
   text/readings.ts    # 読み辞書（コンパイル・適用・当たった語・未知語の抽出）
   audio/pcm.ts        # trimSilence・無音・音量・連結・WAV 書き出し
@@ -65,7 +68,7 @@ interface Engine {
   validateOptions(raw: unknown): EngineOptions;  // 範囲外・未知は ApiError 400
   sentenceCharLimit?(opts: EngineOptions): number;  // 1 文の最大字数（省略時は制限なし）
   verifyModel(path: string): Promise<{ voiceId: string }>;  // 取得後の検査。読めなければ例外
-  synthesize(sentence: string, voice: ModelRecord, opts: EngineOptions, signal: AbortSignal): Promise<Float32Array>;
+  synthesize(sentence: string, voice: ModelRecord, opts: EngineOptions, signal: AbortSignal, slot: number): Promise<Float32Array>;  // slot: 待ち行列のスロット
   status(): EngineStatus;
   close(): Promise<void>;
 }
@@ -77,9 +80,22 @@ interface Engine {
 ## ZEN-TTS エンジン
 
 - 合成は `child_process.fork`（`serialization: 'advanced'` で Float32Array を受け渡す）。worker_threads では解放しても RSS が戻らないため。
-- 子プロセスは同時に 1 つの声だけ読む。別の声が来たら、今の合成が終わってから子を終了して起動し直す。
-- `idleUnloadSec` 使われなければ子を終了。子が落ちたら合成中の要求は 503、次の要求で起動し直す。
+- 子プロセスは待ち行列のスロット（`TTS_CONCURRENCY` 個）ごとに 1 つで、それぞれ 1 つの声だけ読む。
+  そのスロットに別の声が来たら、今の合成が終わってからその子を終了して起動し直す（起動は同時に 1 つずつ）。
+- どのスロットにどの要求を流すかは `queue.ts` が決める。スロットは最後に流した声を覚え、空いたら待ち行列から次の順で 1 件取る
+  （`TTS_CONCURRENCY=1` は FIFO のまま）:
+  1. 先頭の要求が待ち行列に入ってから 15 秒（`PRIORITY_AFTER_MS`）以上たっていれば先頭
+  2. 最初に追い越されてから `TTS_AFFINITY_MAX_WAIT_MS`（既定 5000）以上たった最も古い要求（追い越され続けないため）
+  3. このスロットの声と同じ声の最も古い要求
+  4. 他のスロットが読み込んでいない声の最も古い要求
+  5. 先頭
+  取った要求より前にあった要求は「追い越された」とし、最初に追い越された時刻を覚える（時刻は `performance.now()`）。
+  空きが 2 つあるときは、取る要求の声を読み込んでいるスロットに流す。スロットには `Engine.synthesize` の `slot` で渡す。
+- スロットごとに、`idleUnloadSec` 使われなければその子を終了。読み込み中に `stop()` で止めた子の終了は、他のスロットの待ちを失敗させない。子が落ちたら合成中の要求は 503、次の要求で起動し直す。
 - 1 文ごとに `speak()`（`speakStream` は使わない。文分割は共通層）。1 文の合成 30 秒、要求全体 `TTS_TIMEOUT_SEC`（既定 60）でタイムアウト。
+- 1 回の合成の上限（256 字・512 音素・2048 フレーム）を超えた文（`own tts: … (max …)`）は、子を落とさず `SentenceTooLongError` にする。
+  共通層がその文を中央に最も近い読点・空白・中黒（無ければ中央）で半分に割って合成し直し、無音を挟まずにつなぐ（最大 4 段）。
+  それでも超えるか 1 文字まで割っても超えるなら 422 `unprocessable_text`。数字の長い並びや `zenTts.accentDict` で読みが長くなった文も同じ。
 - `ZenTtsNode.load({ model })`: `modelsPath` は渡さない（G2P はパッケージ同梱）。
 
 ## 設定画面（/admin/）

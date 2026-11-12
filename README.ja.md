@@ -82,7 +82,7 @@ const audio = new Uint8Array(await res.arrayBuffer());
 
 - `TTS_HOSTS`: 待ち受けるアドレス
 - `TTS_ALLOW_CIDRS`: 接続を許すネットワーク
-- `TTS_TOKEN` と `TTS_ADMIN_TOKEN`: API のトークン
+- `TTS_TOKEN` と `TTS_ADMIN_TOKEN`: API のトークン（`TTS_HOSTS` にループバック以外があるときは必須。無いと起動しません）
 
 TLS には対応していないので、VPN かリバースプロキシの内側に置いてください。詳しくは [docs/deployment.md](docs/deployment.md) を見てください。
 

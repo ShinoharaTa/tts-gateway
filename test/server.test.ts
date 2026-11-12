@@ -1,18 +1,23 @@
 import assert from 'node:assert/strict';
-import { createServer, type Server } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { existsSync } from 'node:fs';
+import { createServer, request, type Server } from 'node:http';
+import { chmod, rm, writeFile } from 'node:fs/promises';
+import { connect, type AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { loadConfig } from '../src/config.ts';
 import { createApp, createHandler, type App } from '../src/server.ts';
 import { FakeEngine, installedModel, tempDir } from './helpers.ts';
 
-type Ctx = { base: string; app: App; engine: FakeEngine; stop: () => Promise<void> };
+type Ctx = { base: string; port: number; app: App; engine: FakeEngine; stop: () => Promise<void> };
 
-/** 偽のエンジンで起動する。env は loadConfig に渡す */
+/** 偽のエンジンで起動する。env は loadConfig に渡す（TTS_PORT は空きポートにする。Host の検査が TTS_PORT を見るため） */
 const start = async (env: Record<string, string> = {}): Promise<Ctx> => {
   const { dir, cleanup } = await tempDir();
-  const config = loadConfig({ TTS_DATA_DIR: join(dir, 'data'), TTS_CACHE_DIR: join(dir, 'cache'), FFMPEG: 'false', ...env });
+  const server = createServer();
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
+  const port = (server.address() as AddressInfo).port;
+  const config = loadConfig({ TTS_DATA_DIR: join(dir, 'data'), TTS_CACHE_DIR: join(dir, 'cache'), FFMPEG: 'false', TTS_PORT: String(port), ...env }, () => {});
   const engine = new FakeEngine();
   const app = await createApp(config, {
     engines: deps => {
@@ -22,13 +27,13 @@ const start = async (env: Record<string, string> = {}): Promise<Ctx> => {
     },
     isHostAllowed: h => h === '127.0.0.1',
     protocols: ['http:'],
+    isPortAllowed: () => true,
   });
   await app.registry.add(installedModel('zen-tts', 'marine'));
-  const server = createServer(createHandler(app));
-  await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
-  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  server.on('request', createHandler(app));
+  const base = `http://127.0.0.1:${port}`;
   return {
-    base, app, engine,
+    base, port, app, engine,
     stop: async () => {
       await new Promise<void>(r => server.close(() => r()));
       await app.close();
@@ -58,7 +63,10 @@ test('healthz・engines・404', async () => {
     const nf = await fetch(`${c.base}/v1/nope`);
     assert.equal(nf.status, 404);
     assert.equal(await errorCode(nf), 'not_found');
-    assert.equal((await fetch(`${c.base}/v1/engines`, { method: 'DELETE' })).status, 404);
+    const na = await fetch(`${c.base}/v1/engines`, { method: 'DELETE' });
+    assert.equal(na.status, 405);
+    assert.equal(await errorCode(na), 'method_not_allowed');
+    assert.equal(na.headers.get('allow'), 'GET');
   } finally {
     await c.stop();
   }
@@ -145,8 +153,11 @@ test('normalize と辞書', async () => {
     assert.equal(r.status, 200);
     const all = (await (await fetch(`${c.base}/v1/dictionary`)).json()) as { entries: { surface: string; reading: string; source: string }[] };
     assert.deepEqual(all.entries.find(e => e.surface === 'GitHub'), { surface: 'GitHub', reading: 'ギッハブ', source: 'user' });
-    // 読みの形・頭字語・未知のフィールド
-    for (const [surface, body] of [['Bar', { reading: 'ばー' }], ['API', { reading: 'エーピーアイ' }], ['Bar', { reading: 'バー', x: 1 }]] as const) {
+    // 読みの形（半角カナを含む）・頭字語・# で始まる語・未知のフィールド
+    for (const [surface, body] of [
+      ['Bar', { reading: 'ばー' }], ['Bar', { reading: 'ﾊﾞｰ' }], ['%23Bar', { reading: 'バー' }],
+      ['Bar', { reading: 'バー', x: 1 }],
+    ] as const) {
       r = await fetch(`${c.base}/v1/admin/dictionary/${surface}`, { ...json(body), method: 'PUT' });
       assert.equal(r.status, 400, surface);
     }
@@ -157,6 +168,50 @@ test('normalize と辞書', async () => {
     assert.equal(r.status, 404);
     r = await fetch(`${c.base}/v1/admin/dictionary/Claude`, { method: 'DELETE' });
     assert.equal(r.status, 404);
+  } finally {
+    await c.stop();
+  }
+});
+
+test('入力の上限: surface・読みは 100 字、辞書の適用後は TTS_MAX_CHARS × 3 字まで', async () => {
+  const c = await start();
+  try {
+    const errorOf = async (res: Response) => ((await res.json()) as { error: { code: string; message: string; field?: string } }).error;
+    // 長い読みと文分割で止まっていた入力（読み 1,000 字 × 666 回）。すぐに 400 で返る
+    let started = performance.now();
+    let r = await fetch(`${c.base}/v1/synthesize`, json({ text: 'zz '.repeat(666), readings: { zz: 'ア'.repeat(1000) } }));
+    assert.equal(r.status, 400);
+    assert.equal((await errorOf(r)).field, 'readings.zz');
+    assert.ok(performance.now() - started < 1000, 'synthesize');
+    // 上限内の読みでも、辞書の適用後に長くなりすぎたら 413（synthesize・normalize とも）
+    for (const path of ['/v1/synthesize', '/v1/normalize']) {
+      started = performance.now();
+      r = await fetch(`${c.base}${path}`, json({ text: 'zz '.repeat(666), readings: { zz: 'ア'.repeat(100) } }));
+      assert.equal(r.status, 413, path);
+      const e = await errorOf(r);
+      assert.equal(e.code, 'text_too_long');
+      assert.match(e.message, /after applying/);
+      assert.ok(performance.now() - started < 1000, path);
+    }
+    assert.equal(c.engine.calls.length, 0);
+    // 上限（2,000 × 3 = 6,000 字）以内なら通る。(8 + 1) × 666 = 5,994 字ほど
+    r = await fetch(`${c.base}/v1/normalize`, json({ text: 'zz '.repeat(666), readings: { zz: 'ア'.repeat(8) } }));
+    assert.equal(r.status, 200);
+    const spokenChars = [...((await r.json()) as { spoken: string }).spoken].length;
+    assert.ok(spokenChars > 5900 && spokenChars <= 6000, String(spokenChars));
+    // 辞書 API: surface・読みとも 100 字まで
+    const put = (surface: string, reading: string) =>
+      fetch(`${c.base}/v1/admin/dictionary/${encodeURIComponent(surface)}`, { ...json({ reading }), method: 'PUT' });
+    assert.equal((await put('a'.repeat(100), 'ア'.repeat(100))).status, 200);
+    r = await put('Foo', 'ア'.repeat(101));
+    assert.equal(r.status, 400);
+    assert.equal((await errorOf(r)).field, 'reading');
+    r = await put('Foo', 'ア'.repeat(50_000));
+    assert.equal(r.status, 400);
+    assert.equal((await errorOf(r)).field, 'reading');
+    r = await put('a'.repeat(101), 'ア');
+    assert.equal(r.status, 400);
+    assert.equal((await errorOf(r)).field, 'surface');
   } finally {
     await c.stop();
   }
@@ -173,7 +228,9 @@ test('認証: TTS_TOKEN と TTS_ADMIN_TOKEN', async () => {
     assert.equal(r.headers.get('www-authenticate'), 'Bearer');
     assert.equal((await get('/v1/engines', 'wrong')).status, 401);
     assert.equal((await get('/v1/engines', 'user-token')).status, 200);
-    assert.equal((await get('/v1/engines', 'admin-token')).status, 401);
+    // 管理トークンは通常の API にも使える（逆は不可）
+    assert.equal((await get('/v1/engines', 'admin-token')).status, 200);
+    assert.equal((await get('/v1/dictionary', 'admin-token')).status, 200);
     assert.equal((await get('/v1/admin/status', 'user-token')).status, 401);
     assert.equal((await get('/v1/admin/status', 'admin-token')).status, 200);
     // 認証は 415 より先
@@ -188,7 +245,15 @@ test('認証: TTS_TOKEN と TTS_ADMIN_TOKEN', async () => {
     assert.equal((await get('/admin/admin.css')).status, 200);
     const redirect = await fetch(`${c.base}/admin`, { redirect: 'manual' });
     assert.equal(redirect.status, 301);
-    assert.equal((await get('/admin/../package.json')).status, 404);
+    assert.equal((await get('/admin/../package.json', 'user-token')).status, 404);
+    // 未定義のパスも認証が先
+    assert.equal((await get('/v1/nope')).status, 401);
+    assert.equal((await get('/v1/nope', 'user-token')).status, 404);
+    assert.equal((await get('/v1/admin/nope', 'user-token')).status, 401);
+    assert.equal((await get('/v1/admin/nope', 'admin-token')).status, 404);
+    // 存在するパスへの未対応メソッドも認証が先
+    assert.equal((await fetch(`${c.base}/v1/engines`, { method: 'DELETE' })).status, 401);
+    assert.equal((await fetch(`${c.base}/v1/engines`, { method: 'DELETE', headers: { Authorization: 'Bearer user-token' } })).status, 405);
   } finally {
     await c.stop();
   }
@@ -276,5 +341,342 @@ test('models: 追加（URL）→ 取得 → installed、409、削除', async () 
   } finally {
     await c.stop();
     await new Promise<void>(r => origin.close(() => r()));
+  }
+});
+
+test('models: 同時ダウンロードの上限（429）・登録数の上限（400）・重なった取り直し（409）', async () => {
+  // /stall は一部だけ送って止まる。/file は全部返す
+  const origin: Server = createServer((req, res) => {
+    res.writeHead(200, { 'Content-Length': '3000' });
+    if (req.url === '/file') res.end(Buffer.alloc(3000, 1));
+    else res.write(Buffer.alloc(10, 1));
+  });
+  await new Promise<void>(r => origin.listen(0, '127.0.0.1', r));
+  const o = `http://127.0.0.1:${(origin.address() as AddressInfo).port}`;
+  const c = await start();
+  try {
+    const post = (body: unknown) => fetch(`${c.base}/v1/admin/models`, json(body));
+    assert.equal((await post({ engine: 'zen-tts', id: 's1', url: `${o}/stall` })).status, 202);
+    assert.equal((await post({ engine: 'zen-tts', id: 's2', url: `${o}/stall` })).status, 202);
+    const r = await post({ engine: 'zen-tts', id: 's3', url: `${o}/stall` });
+    assert.equal(r.status, 429);
+    assert.equal(r.headers.get('retry-after'), '5');
+    assert.equal(c.app.registry.get('zen-tts', 's3'), undefined);
+    // 取り直しも上限に数える
+    await c.app.registry.add({ ...installedModel('zen-tts', 'e1'), status: 'error' });
+    assert.equal((await fetch(`${c.base}/v1/admin/models/zen-tts/e1/download`, { method: 'POST' })).status, 429);
+    // 取得中のものを消すと止まり、.part も残らない
+    for (const id of ['s1', 's2']) assert.equal((await fetch(`${c.base}/v1/admin/models/zen-tts/${id}`, { method: 'DELETE' })).status, 204);
+    assert.equal(c.app.downloader.isActive('zen-tts', 's1'), false);
+    assert.equal(c.app.registry.get('zen-tts', 's1'), undefined);
+    assert.equal(existsSync(`${c.app.registry.modelPath('zen-tts', 's1', '.fake')}.part`), false);
+
+    // 同じ id の取り直しが重なったら 2 つ目は 409
+    await c.app.registry.update('zen-tts', 'e1', { source: { url: `${o}/stall`, sha256: null } });
+    const both = await Promise.all([1, 2].map(() => fetch(`${c.base}/v1/admin/models/zen-tts/e1/download`, { method: 'POST' })));
+    assert.deepEqual(both.map(x => x.status).sort(), [202, 409]);
+    const loser = both.find(x => x.status === 409)!;
+    assert.equal(await errorCode(loser), 'conflict');
+    assert.equal((await fetch(`${c.base}/v1/admin/models/zen-tts/e1`, { method: 'DELETE' })).status, 204);
+
+    // 登録は合計 50 件まで（marine を含む）
+    for (let i = c.app.registry.list().length; i < 50; i++) await c.app.registry.add(installedModel('zen-tts', `x${i}`));
+    const full = await post({ engine: 'zen-tts', id: 'over', url: `${o}/file` });
+    assert.equal(full.status, 400);
+    assert.match(((await full.json()) as { error: { message: string } }).error.message, /50/);
+  } finally {
+    origin.closeAllConnections();
+    await c.stop();
+    await new Promise<void>(r => origin.close(() => r()));
+  }
+});
+
+test('models: 削除の処理中（取得の終わりを待っている間）の同じ id の追加・取り直しは 409', async () => {
+  const file = Buffer.alloc(3000, 1);
+  const origin: Server = createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Length': String(file.length) });
+    res.end(file);
+  });
+  await new Promise<void>(r => origin.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${(origin.address() as AddressInfo).port}/m.fake`;
+  const c = await start();
+  try {
+    // 検査（verifying）で止めておく。削除は取得の終わりを待つので、その間が「削除の処理中」
+    let release!: () => void;
+    const gate = new Promise<void>(r => (release = r));
+    let verifying!: () => void;
+    const reached = new Promise<void>(r => (verifying = r));
+    c.engine.verifyModel = async () => {
+      verifying();
+      await gate;
+      return { voiceId: 'fake' };
+    };
+    assert.equal((await fetch(`${c.base}/v1/admin/models`, json({ engine: 'zen-tts', id: 'mine', url }))).status, 202);
+    await reached;
+    const del = fetch(`${c.base}/v1/admin/models/zen-tts/mine`, { method: 'DELETE' });
+    while (!c.app.downloader.isDeleting('zen-tts', 'mine')) await new Promise(r => setTimeout(r, 5));
+    const again = await fetch(`${c.base}/v1/admin/models/zen-tts/mine/download`, { method: 'POST' });
+    assert.equal(again.status, 409);
+    assert.match(((await again.json()) as { error: { message: string } }).error.message, /being deleted/);
+    const add = await fetch(`${c.base}/v1/admin/models`, json({ engine: 'zen-tts', id: 'mine', url }));
+    assert.equal(add.status, 409);
+    assert.match(((await add.json()) as { error: { message: string } }).error.message, /being deleted/);
+    release();
+    assert.equal((await del).status, 204);
+    assert.equal(c.app.registry.get('zen-tts', 'mine'), undefined);
+    const path = c.app.registry.modelPath('zen-tts', 'mine', '.fake');
+    assert.equal(existsSync(path), false);
+    assert.equal(existsSync(`${path}.part`), false);
+    // 削除が終われば同じ id で追加できる
+    c.engine.verifyModel = async () => ({ voiceId: 'fake' });
+    assert.equal((await fetch(`${c.base}/v1/admin/models`, json({ engine: 'zen-tts', id: 'mine', url }))).status, 202);
+    await c.app.downloader.wait('zen-tts', 'mine');
+    assert.equal(c.app.registry.get('zen-tts', 'mine')!.status, 'installed');
+  } finally {
+    await c.stop();
+    await new Promise<void>(r => origin.close(() => r()));
+  }
+});
+
+type Raw = { status: number; headers: Record<string, string | string[] | undefined>; body: string };
+
+/** Host を自分で決めて送る（fetch は Host を付け替えるため） */
+const raw = (c: Ctx, method: string, path: string, headers: Record<string, string>, body?: string): Promise<Raw> =>
+  new Promise((resolve, reject) => {
+    const req = request({ host: '127.0.0.1', port: c.port, method, path, headers, setHost: false }, res => {
+      const chunks: Buffer[] = [];
+      res.on('data', (d: Buffer) => chunks.push(d));
+      res.on('end', () => resolve({ status: res.statusCode!, headers: res.headers, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('error', reject);
+    req.end(body);
+  });
+
+const rawCode = (r: Raw): string => (JSON.parse(r.body) as { error: { code: string } }).error.code;
+
+test('Host: TTS_HOSTS:TTS_PORT と localhost:TTS_PORT だけ。ほかと欠落は 421', async () => {
+  const c = await start();
+  try {
+    for (const host of [`127.0.0.1:${c.port}`, `localhost:${c.port}`, `LocalHost:${c.port}`]) {
+      assert.equal((await raw(c, 'GET', '/v1/engines', { Host: host })).status, 200, host);
+    }
+    for (const host of ['evil.example.com', `evil.example.com:${c.port}`, '127.0.0.1', `127.0.0.1:${c.port + 1}`, 'localhost', `[::1]:${c.port}`, '']) {
+      for (const path of ['/healthz', '/v1/engines', '/admin/']) {
+        const r = await raw(c, 'GET', path, { Host: host });
+        assert.equal(r.status, 421, `${host} ${path}`);
+        assert.equal(rawCode(r), 'misdirected_request');
+      }
+    }
+    // Host 無し（HTTP/1.0）
+    const res = await new Promise<string>((resolve, reject) => {
+      const sock = connect(c.port, '127.0.0.1', () => sock.end('GET /healthz HTTP/1.0\r\n\r\n'));
+      let data = '';
+      sock.on('data', d => (data += d));
+      sock.on('end', () => resolve(data));
+      sock.on('error', reject);
+    });
+    assert.match(res, /^HTTP\/1\.1 421 /);
+  } finally {
+    await c.stop();
+  }
+});
+
+test('ffmpeg が無い: mp3 は 503、エンジンのサンプルレートの wav は 200、status に available=false', async () => {
+  const c = await start({ FFMPEG: '/nonexistent/ffmpeg' });
+  try {
+    const st = (await (await fetch(`${c.base}/v1/admin/status`)).json()) as { ffmpeg: unknown };
+    assert.deepEqual(st.ffmpeg, { available: false, path: '/nonexistent/ffmpeg', version: null, reason: 'spawn /nonexistent/ffmpeg ENOENT' });
+    const mp3 = await fetch(`${c.base}/v1/synthesize`, json({ text: 'こんにちは。', format: 'mp3' }));
+    assert.equal(mp3.status, 503);
+    assert.deepEqual(await mp3.json(), { error: { code: 'engine_unavailable', message: 'ffmpeg is not available (/nonexistent/ffmpeg)' } });
+    // リサンプルの要る wav も 503
+    assert.equal((await fetch(`${c.base}/v1/synthesize`, json({ text: 'こんにちは。', sampleRate: 16000 }))).status, 503);
+    assert.equal(c.engine.calls.length, 0);
+    const wav = await fetch(`${c.base}/v1/synthesize`, json({ text: 'こんにちは。', sampleRate: 8000 }));
+    assert.equal(wav.status, 200);
+    assert.equal(wav.headers.get('content-type'), 'audio/wav');
+  } finally {
+    await c.stop();
+  }
+});
+
+test('ffmpeg が probe の後に消えた: mp3 は 500 ではなく 503 engine_unavailable', async () => {
+  const { dir, cleanup } = await tempDir();
+  const fake = join(dir, 'ffmpeg');
+  await writeFile(fake, '#!/bin/sh\necho "ffmpeg version 7.0.2"\n');
+  await chmod(fake, 0o755);
+  const c = await start({ FFMPEG: fake });
+  try {
+    const st = (await (await fetch(`${c.base}/v1/admin/status`)).json()) as { ffmpeg: { available: boolean } };
+    assert.equal(st.ffmpeg.available, true);
+    await rm(fake);
+    const mp3 = await fetch(`${c.base}/v1/synthesize`, json({ text: 'こんにちは。', format: 'mp3' }));
+    assert.equal(mp3.status, 503);
+    assert.deepEqual(await mp3.json(), { error: { code: 'engine_unavailable', message: `ffmpeg is not available (${fake})` } });
+  } finally {
+    await c.stop();
+    await cleanup();
+  }
+});
+
+/** 条件が満たされるまで待つ（最大 2 秒） */
+const until = async (cond: () => boolean): Promise<void> => {
+  for (let i = 0; i < 200 && !cond(); i++) await new Promise(r => setTimeout(r, 10));
+  assert.ok(cond());
+};
+
+test('synthesize: 合成中に接続を切るとエンジンの signal が abort され、キャッシュに書かない', async () => {
+  const c = await start();
+  try {
+    c.engine.delayMs = 1000;
+    const ac = new AbortController();
+    const res = fetch(`${c.base}/v1/synthesize`, { ...json({ text: 'こんにちは。' }), signal: ac.signal });
+    await until(() => c.engine.signals.length === 1);
+    ac.abort();
+    await assert.rejects(res);
+    await until(() => c.engine.signals[0]!.aborted);
+    await until(() => c.app.queue.stats().running === 0);
+    c.engine.delayMs = 0;
+    const r = await fetch(`${c.base}/v1/synthesize`, json({ text: 'こんにちは。' }));
+    assert.equal(r.status, 200);
+    assert.equal(r.headers.get('x-cache'), 'miss');
+  } finally {
+    await c.stop();
+  }
+});
+
+test('Host: TTS_ALLOWED_HOSTS はポートを問わず、大文字小文字を区別しない', async () => {
+  const c = await start({ TTS_ALLOWED_HOSTS: 'tts.example.com, MyHost.tailnet.example' });
+  try {
+    for (const host of ['tts.example.com', 'TTS.example.com:443', `tts.example.com:${c.port}`, 'myhost.tailnet.example:8080', `127.0.0.1:${c.port}`]) {
+      assert.equal((await raw(c, 'GET', '/healthz', { Host: host })).status, 200, host);
+    }
+    for (const host of ['x.tts.example.com', 'tts.example.com.evil.example', 'tts.example.com:abc', 'tts.example.com:']) {
+      assert.equal((await raw(c, 'GET', '/healthz', { Host: host })).status, 421, host);
+    }
+  } finally {
+    await c.stop();
+  }
+});
+
+test('Host: IPv6 は [addr]:port、ポート 80 ならポート無しも可', async () => {
+  const v6 = await start({ TTS_HOSTS: '::1' });
+  try {
+    assert.equal((await raw(v6, 'GET', '/healthz', { Host: `[::1]:${v6.port}` })).status, 200);
+    assert.equal((await raw(v6, 'GET', '/healthz', { Host: `localhost:${v6.port}` })).status, 200);
+    assert.equal((await raw(v6, 'GET', '/healthz', { Host: `127.0.0.1:${v6.port}` })).status, 421);
+    assert.equal((await raw(v6, 'GET', '/healthz', { Host: '[::1]' })).status, 421);
+  } finally {
+    await v6.stop();
+  }
+  const p80 = await start({ TTS_PORT: '80' });
+  try {
+    for (const host of ['127.0.0.1', '127.0.0.1:80', 'localhost', 'localhost:80']) {
+      assert.equal((await raw(p80, 'GET', '/healthz', { Host: host })).status, 200, host);
+    }
+    assert.equal((await raw(p80, 'GET', '/healthz', { Host: `127.0.0.1:${p80.port}` })).status, 421);
+  } finally {
+    await p80.stop();
+  }
+});
+
+test('Origin: GET / HEAD / OPTIONS 以外で許可外・null なら 403、無ければ通す', async () => {
+  const c = await start({ TTS_ALLOWED_HOSTS: 'tts.example.com' });
+  try {
+    const host = `127.0.0.1:${c.port}`;
+    const post = (headers: Record<string, string>) =>
+      raw(c, 'POST', '/v1/normalize', { Host: host, 'Content-Type': 'application/json', ...headers }, JSON.stringify({ text: 'a' }));
+    assert.equal((await post({})).status, 200);
+    assert.equal((await post({ Origin: `http://127.0.0.1:${c.port}` })).status, 200);
+    assert.equal((await post({ Origin: `http://localhost:${c.port}` })).status, 200);
+    assert.equal((await post({ Origin: 'https://tts.example.com' })).status, 200);
+    for (const origin of ['http://evil.example.com', `http://evil.example.com:${c.port}`, 'http://127.0.0.1', `http://127.0.0.1:${c.port + 1}`, 'null', 'garbage']) {
+      const r = await post({ Origin: origin });
+      assert.equal(r.status, 403, origin);
+      assert.equal(rawCode(r), 'forbidden_origin');
+    }
+    // 管理 API の PUT / DELETE も同じ
+    assert.equal((await raw(c, 'DELETE', '/v1/admin/cache', { Host: host, Origin: 'http://evil.example.com' })).status, 403);
+    // 読むだけのメソッドは Origin を見ない
+    assert.equal((await raw(c, 'GET', '/v1/engines', { Host: host, Origin: 'http://evil.example.com' })).status, 200);
+    assert.equal((await raw(c, 'HEAD', '/healthz', { Host: host, Origin: 'null' })).status, 200);
+  } finally {
+    await c.stop();
+  }
+});
+
+test('400（不正なリクエストターゲット）・405・415（本文が空でも）・HEAD /healthz', async () => {
+  const c = await start();
+  try {
+    const host = `127.0.0.1:${c.port}`;
+    const bad = await raw(c, 'GET', '//', { Host: host });
+    assert.equal(bad.status, 400);
+    assert.equal(rawCode(bad), 'bad_request');
+
+    const head = await raw(c, 'HEAD', '/healthz', { Host: host });
+    assert.equal(head.status, 200);
+    assert.equal(head.body, '');
+
+    for (const [method, path, allow] of [
+      ['POST', '/healthz', 'GET, HEAD'],
+      ['PUT', '/v1/synthesize', 'POST'],
+      ['POST', '/v1/admin/settings', 'GET, PUT'],
+      ['POST', '/admin/', 'GET, HEAD'],
+      ['DELETE', '/admin', 'GET, HEAD'],
+    ] as const) {
+      const r = await raw(c, method, path, { Host: host });
+      assert.equal(r.status, 405, `${method} ${path}`);
+      assert.equal(rawCode(r), 'method_not_allowed');
+      assert.equal(r.headers.allow, allow, `${method} ${path}`);
+    }
+
+    for (const [method, path] of [['POST', '/v1/synthesize'], ['POST', '/v1/normalize'], ['PUT', '/v1/admin/settings'], ['POST', '/v1/admin/models'], ['PUT', '/v1/admin/dictionary/Foo']] as const) {
+      for (const headers of [{}, { 'Content-Type': 'text/plain' }, { 'Content-Length': '0' }]) {
+        const r = await raw(c, method, path, { Host: host, ...headers });
+        assert.equal(r.status, 415, `${method} ${path} ${JSON.stringify(headers)}`);
+        assert.equal(rawCode(r), 'unsupported_media_type');
+      }
+    }
+  } finally {
+    await c.stop();
+  }
+});
+
+test('synthesize: 合流中は 1 人が切断しても合成を続け、残った要求に返す。全員が切断したら止める', async () => {
+  const c = await start();
+  try {
+    c.engine.delayMs = 300;
+    const body = json({ text: 'こんにちは。' });
+    const ac = new AbortController();
+    const gone = fetch(`${c.base}/v1/synthesize`, { ...body, signal: ac.signal });
+    await until(() => c.engine.signals.length === 1);
+    const stay = fetch(`${c.base}/v1/synthesize`, body);
+    // 合流するまで待ってから切る
+    await new Promise(r => setTimeout(r, 50));
+    ac.abort();
+    await assert.rejects(gone);
+    const r = await stay;
+    assert.equal(r.status, 200);
+    assert.equal(r.headers.get('x-cache'), 'miss');
+    assert.equal(c.engine.calls.length, 1);
+    assert.equal(c.engine.signals[0]!.aborted, false);
+
+    // 全員が切断
+    c.engine.delayMs = 1000;
+    const body2 = json({ text: 'さようなら。' });
+    const acs = [new AbortController(), new AbortController()];
+    // 切った方の reject を待つ間に未処理にしない
+    const both = acs.map(a => fetch(`${c.base}/v1/synthesize`, { ...body2, signal: a.signal }).then(() => 'ok', () => 'aborted'));
+    await until(() => c.engine.signals.length === 2);
+    await new Promise(r => setTimeout(r, 50));
+    acs[0]!.abort();
+    await new Promise(r => setTimeout(r, 50));
+    assert.equal(c.engine.signals[1]!.aborted, false);
+    acs[1]!.abort();
+    assert.deepEqual(await Promise.all(both), ['aborted', 'aborted']);
+    await until(() => c.engine.signals[1]!.aborted);
+    assert.equal(c.engine.calls.length, 2);
+  } finally {
+    await c.stop();
   }
 });

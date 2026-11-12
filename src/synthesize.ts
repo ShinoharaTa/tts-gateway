@@ -1,19 +1,19 @@
 /**
- * 合成の流れ: 前処理（spoken.ts）→ 読み辞書（readings.ts）→ 文分割 → エンジン（1 文ずつ）→ 無音処理・連結・音量 → エンコード。
+ * 合成の流れ: 前処理の前段（spoken.ts。NFKC・URL とメールの削除）→ 読み辞書（readings.ts）→ 前処理の後段（記号の規則）→ 文分割 → エンジン（1 文ずつ）→ 無音処理・連結・音量 → エンコード。
  * キャッシュ（cache.ts）と待ち行列（queue.ts）もここでつなぐ。
  */
 import { createHash } from 'node:crypto';
 import { ApiError, invalid, notFound } from './errors.ts';
 import type { AudioCache } from './cache.ts';
-import { CONTENT_TYPES, DEFAULT_BITRATES, encode, outputSampleRate } from './audio/encode.ts';
+import { CONTENT_TYPES, DEFAULT_BITRATES, encode, ffmpegUnavailable, needsFfmpeg, outputSampleRate, type FfmpegProbe } from './audio/encode.ts';
 import { applyGain, concat, samplesToMs, silence, trimSilence } from './audio/pcm.ts';
-import type { Engine } from './engines/types.ts';
+import { SentenceTooLongError, type Engine } from './engines/types.ts';
 import type { ModelRecord, Registry } from './models/registry.ts';
 import type { SynthQueue } from './queue.ts';
 import type { SettingsStore } from './settings.ts';
 import type { Dictionary, Hit, UnknownWord } from './text/readings.ts';
-import { toSpoken } from './text/spoken.ts';
-import { validateSynthRequest, type SynthRequest } from './validate.ts';
+import { afterReadings, beforeReadings } from './text/spoken.ts';
+import { charCount, validateSynthRequest, type SynthRequest } from './validate.ts';
 
 // ---- 文分割 ----
 
@@ -21,6 +21,8 @@ const SENTENCE_END_RE = /[。！？!?]/;
 const SOFT_BREAK_RE = /[、，, 　]/;
 /** 読める文字（文字か数字）を含むか */
 const SPEAKABLE_RE = /[\p{L}\p{N}]/u;
+/** String.prototype.trim が落とす文字（\s と同じ集合） */
+const SPACE_RE = /^\s$/;
 
 /**
  * 文に分ける。「。！？!?」の後（記号は前の文に付ける）と改行で切り、maxChars を超える文は
@@ -28,23 +30,28 @@ const SPEAKABLE_RE = /[\p{L}\p{N}]/u;
  */
 export const splitSentences = (text: string, maxChars: number): string[] => {
   const out: string[] = [];
-  const push = (s: string): void => {
-    let rest = s.trim();
-    while ([...rest].length > maxChars) {
-      const chars = [...rest];
+  const emit = (chars: readonly string[], from: number, to: number): void => {
+    const s = chars.slice(from, to).join('').trim();
+    if (s && SPEAKABLE_RE.test(s)) out.push(s);
+  };
+  // chars[from, to) を 1 文として出す。文字列を作り直さず位置だけ進める（長い文でも線形時間）。前後の空白は trim と同じく落とす
+  const push = (chars: readonly string[], from: number, to: number): void => {
+    while (from < to && SPACE_RE.test(chars[from]!)) from++;
+    while (to > from && SPACE_RE.test(chars[to - 1]!)) to--;
+    while (to - from > maxChars) {
       let cut = -1;
       for (let i = maxChars - 1; i > 0; i--) {
-        if (SOFT_BREAK_RE.test(chars[i]!)) {
+        if (SOFT_BREAK_RE.test(chars[from + i]!)) {
           cut = i + 1;
           break;
         }
       }
       if (cut <= 0) cut = maxChars;
-      const head = chars.slice(0, cut).join('').trim();
-      if (head && SPEAKABLE_RE.test(head)) out.push(head);
-      rest = chars.slice(cut).join('').trim();
+      emit(chars, from, from + cut);
+      from += cut;
+      while (from < to && SPACE_RE.test(chars[from]!)) from++;
     }
-    if (rest && SPEAKABLE_RE.test(rest)) out.push(rest);
+    emit(chars, from, to);
   };
   for (const line of text.split(/\r?\n/)) {
     let start = 0;
@@ -52,11 +59,11 @@ export const splitSentences = (text: string, maxChars: number): string[] => {
     for (let i = 0; i < chars.length; i++) {
       // 「！？」の連なり（？！ など）は 1 つの文末として扱う
       if (SENTENCE_END_RE.test(chars[i]!) && !SENTENCE_END_RE.test(chars[i + 1] ?? '')) {
-        push(chars.slice(start, i + 1).join(''));
+        push(chars, start, i + 1);
         start = i + 1;
       }
     }
-    push(chars.slice(start).join(''));
+    push(chars, start, chars.length);
   }
   return out;
 };
@@ -65,10 +72,23 @@ export const splitSentences = (text: string, maxChars: number): string[] => {
 
 export type Prepared = { spoken: string; sentences: string[]; hits: Hit[]; unknownWords: UnknownWord[] };
 
-export const prepareText = (req: Pick<SynthRequest, 'text' | 'preprocess' | 'dictionary' | 'readings' | 'maxSentenceChars'>, dict: Dictionary): Prepared => {
-  const pre = req.preprocess ? toSpoken(req.text) : req.text.normalize('NFKC');
+/** 前処理と辞書を通した後の文は、text の上限（TTS_MAX_CHARS）のこの倍まで */
+export const SPOKEN_CHARS_FACTOR = 3;
+
+/** maxChars: text の上限（TTS_MAX_CHARS）。前処理と辞書の後の文が maxChars × SPOKEN_CHARS_FACTOR 字を超えたら 413 */
+export const prepareText = (
+  req: Pick<SynthRequest, 'text' | 'preprocess' | 'dictionary' | 'readings' | 'maxSentenceChars'>,
+  dict: Dictionary,
+  maxChars: number,
+): Prepared => {
+  // 辞書は記号の規則より先に当てる（GPT-4o・COVID-19 を崩す前に）。normalize と synthesize は同じ順
+  const pre = req.preprocess ? beforeReadings(req.text) : req.text.normalize('NFKC');
   const readings = dict.withRequest(req.readings);
-  const spoken = req.dictionary ? readings.apply(pre) : pre;
+  const replaced = req.dictionary ? readings.apply(pre) : pre;
+  const spoken = req.preprocess ? afterReadings(replaced) : replaced;
+  const limit = maxChars * SPOKEN_CHARS_FACTOR;
+  if (charCount(spoken) > limit)
+    throw new ApiError(413, 'text_too_long', `text is longer than ${limit} characters after applying preprocessing and the reading dictionary`, 'text');
   return {
     spoken,
     sentences: splitSentences(spoken, req.maxSentenceChars),
@@ -127,6 +147,55 @@ export const cacheKey = (o: {
 
 // ---- 音声を作る ----
 
+/** 1 回の合成の上限を超えた文を割り直す深さの上限（最大 2^4 = 16 片） */
+export const MAX_SPLIT_DEPTH = 4;
+/** 割る位置にする文字（読点・空白・中黒） */
+const SPLIT_AT_RE = /[、，, 　・]/;
+
+/** 文を 2 つに割る。中央に最も近い読点・空白・中黒の後（無ければ中央のコードポイント境界）。1 文字なら null */
+export const splitInHalf = (sentence: string): [string, string] | null => {
+  const chars = [...sentence];
+  if (chars.length < 2) return null;
+  const mid = chars.length / 2;
+  let cut = Math.floor(mid);
+  let best = Infinity;
+  for (let i = 0; i < chars.length - 1; i++) {
+    if (SPLIT_AT_RE.test(chars[i]!) && Math.abs(i + 1 - mid) < best) {
+      best = Math.abs(i + 1 - mid);
+      cut = i + 1;
+    }
+  }
+  return [chars.slice(0, cut).join(''), chars.slice(cut).join('')];
+};
+
+/**
+ * 1 文を合成する。エンジンの上限を超えたら（SentenceTooLongError）半分に割ってそれぞれ合成し、無音を挟まずにつなぐ。
+ * MAX_SPLIT_DEPTH 段割っても、1 文字まで割っても超えるなら 422 unprocessable_text
+ */
+export const synthesizeSentence = async (
+  o: { engine: Engine; voice: ModelRecord; options: Record<string, unknown>; signal: AbortSignal; slot: number },
+  sentence: string,
+  depth = 0,
+): Promise<Float32Array> => {
+  try {
+    return await o.engine.synthesize(sentence, o.voice, o.options, o.signal, o.slot);
+  } catch (e) {
+    if (!(e instanceof SentenceTooLongError)) throw e;
+    // 中断されたら割り直さない
+    o.signal.throwIfAborted();
+    const halves = depth < MAX_SPLIT_DEPTH ? splitInHalf(sentence) : null;
+    if (!halves) throw new ApiError(422, 'unprocessable_text', 'text contains a word too long to read');
+    const parts: Float32Array[] = [];
+    for (const half of halves) {
+      // 割った片の端の空白は落とし、読める文字の無い片は飛ばす
+      const piece = half.trim();
+      o.signal.throwIfAborted();
+      if (piece && SPEAKABLE_RE.test(piece)) parts.push(await synthesizeSentence(o, piece, depth + 1));
+    }
+    return concat(parts);
+  }
+};
+
 /** 文を順に合成し、無音・連結・音量を経てエンコードする */
 export const renderAudio = async (o: {
   engine: Engine;
@@ -136,19 +205,21 @@ export const renderAudio = async (o: {
   options: Record<string, unknown>;
   signal: AbortSignal;
   ffmpeg: string;
+  /** 待ち行列のスロット（エンジンの合成プロセス）。省略時は 0 */
+  slot?: number;
 }): Promise<{ audio: Buffer; durationMs: number; sampleRate: number }> => {
   const sr = o.engine.sampleRate;
   const p = o.params;
   const parts: Float32Array[] = [silence(p.leadingSilenceMs, sr)];
   for (const [i, sentence] of o.sentences.entries()) {
-    let pcm = await o.engine.synthesize(sentence, o.voice, o.options, o.signal);
+    let pcm = await synthesizeSentence({ ...o, slot: o.slot ?? 0 }, sentence);
     if (p.trimSilence) pcm = trimSilence(pcm, sr);
     if (i > 0) parts.push(silence(p.sentencePauseMs, sr));
     parts.push(pcm);
   }
   parts.push(silence(p.trailingSilenceMs, sr));
   const pcm = applyGain(concat(parts), p.volume);
-  const audio = await encode(pcm, sr, { format: p.format, sampleRate: p.sampleRate, bitrate: p.bitrate, ffmpeg: o.ffmpeg });
+  const audio = await encode(pcm, sr, { format: p.format, sampleRate: p.sampleRate, bitrate: p.bitrate, ffmpeg: o.ffmpeg, signal: o.signal });
   return { audio, durationMs: samplesToMs(pcm.length, sr), sampleRate: outputSampleRate(p.format, p.sampleRate) };
 };
 
@@ -174,6 +245,8 @@ export type SynthesizerDeps = {
   maxChars: number;
   timeoutSec: number;
   ffmpeg: string;
+  /** ffmpeg の有無（省略時は使える扱い）。使えなければ ffmpeg の要る要求を起動せずに 503 */
+  ffmpegProbe?: FfmpegProbe;
 };
 
 export class Synthesizer {
@@ -194,7 +267,8 @@ export class Synthesizer {
   /** POST /v1/normalize */
   normalize(raw: unknown): Prepared & { text: string } {
     const req = this.validate(raw);
-    const p = prepareText(req, this.d.dictionary);
+    const limit = this.d.engines.get(req.engine)!.sentenceCharLimit?.(req.options) ?? Infinity;
+    const p = prepareText({ ...req, maxSentenceChars: Math.min(req.maxSentenceChars, limit) }, this.d.dictionary, this.d.maxChars);
     return { text: req.text, ...p };
   }
 
@@ -208,13 +282,13 @@ export class Synthesizer {
     return rec;
   }
 
-  /** POST /v1/synthesize */
-  async synthesize(raw: unknown): Promise<SynthResult> {
+  /** POST /v1/synthesize。signal はクライアントの切断（待ち行列・エンジン・ffmpeg まで届く。合流中は全員が切断したときだけ止める） */
+  async synthesize(raw: unknown, signal?: AbortSignal): Promise<SynthResult> {
     const req = this.validate(raw);
     const engine = this.d.engines.get(req.engine)!;
     const voice = this.resolveVoice(engine, req.voice);
     const limit = engine.sentenceCharLimit?.(req.options) ?? Infinity;
-    const { sentences } = prepareText({ ...req, maxSentenceChars: Math.min(req.maxSentenceChars, limit) }, this.d.dictionary);
+    const { sentences } = prepareText({ ...req, maxSentenceChars: Math.min(req.maxSentenceChars, limit) }, this.d.dictionary, this.d.maxChars);
     if (sentences.length === 0) throw invalid('text has nothing to read', 'text');
 
     const params: RenderParams = {
@@ -240,16 +314,24 @@ export class Synthesizer {
         };
     }
 
+    if (this.d.ffmpegProbe && needsFfmpeg(params.format, params.sampleRate, engine.sampleRate)) {
+      if (!(await this.d.ffmpegProbe.get()).available) throw ffmpegUnavailable(this.d.ffmpeg);
+    }
+
     // キャッシュを使わない要求は合流しない（毎回作る）
-    const { promise } = this.d.queue.run(useCache ? key : undefined, async () => {
+    // 待ち行列での待ちも timeoutSec まで（要求全体のタイムアウトは実行が始まってから数える）
+    const { promise } = this.d.queue.run(useCache ? key : undefined, async (slot, stop) => {
       const started = performance.now();
       const ac = new AbortController();
       const timer = setTimeout(
         () => ac.abort(new ApiError(504, 'timeout', `synthesis took longer than ${this.d.timeoutSec}s`)),
         this.d.timeoutSec * 1000,
       );
+      const jobSignal = AbortSignal.any([ac.signal, stop]);
       try {
-        const r = await renderAudio({ engine, voice, sentences, params, options: req.options, signal: ac.signal, ffmpeg: this.d.ffmpeg });
+        const r = await renderAudio({ engine, voice, sentences, params, options: req.options, signal: jobSignal, ffmpeg: this.d.ffmpeg, slot });
+        // 中断された合成はキャッシュに書かない
+        if (jobSignal.aborted) throw jobSignal.reason;
         const synthesisMs = Math.round(performance.now() - started);
         if (useCache) {
           await this.d.cache
@@ -260,7 +342,7 @@ export class Synthesizer {
       } finally {
         clearTimeout(timer);
       }
-    });
+    }, `${engine.id}/${voice.id}`, { signal, waitTimeoutMs: this.d.timeoutSec * 1000 });
     const r = await promise;
     return {
       audio: r.audio, contentType, engine, voice: voice.id, durationMs: r.durationMs, sampleRate: r.sampleRate,

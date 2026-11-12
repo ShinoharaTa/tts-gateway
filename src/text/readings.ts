@@ -1,9 +1,12 @@
 /**
- * 読み辞書（英字の語 → カタカナ）。前処理（spoken.ts）の後で、文の語を読みに置き換える（docs/api.md「読み辞書の規則」）。
+ * 読み辞書（英字の語 → カタカナ）。前処理の前の段（spoken.ts の beforeReadings: NFKC・URL とメールの削除）と
+ * 後の段（afterReadings: 記号の規則）の間で、文の語を読みに置き換える（docs/api.md「読み辞書の規則」）。
  *
  * - 照合は NFKC + 大文字小文字を同一視。単語境界は、前が英数字でないこと・後ろが英字でないこと（iPhone16 → アイフォーン16）。
- *   長い surface から当てる（Hugging Face を Hugging より先に）。URL・メールアドレス・ドメイン（example.com）の中は置き換えない
- * - 全部大文字で 5 字以内の語（API, AWS, GPU, PS5）は頭字語として置き換えない（ZEN-TTS の略語規則に任せる）
+ *   長い surface から当てる（Hugging Face を Hugging より先に）。URL・メールアドレス・ドメイン（example.com）の中は置き換えない。
+ *   ただし surface 自体がドットを含む語（Character.AI、Booking.com）はドメインの形でも当てる
+ * - 登録した語は全部大文字でも置き換える（NASA、API）。未知語の候補からは全部大文字 3 字以内（API, GPU）を除く（ZEN-TTS が綴りで読む）
+ * - surface の語の間の空白は改行をまたがない（行末の MacBook と次の行頭の Pro を 1 語にしない）
  * - 置き換えた語の直後の所有格 's は消し、「-数字」「-英字」はハイフンを空白にする（Pixel-9 → ピクセル 9。マイナスと読ませない）
  * - 辞書は 組み込み（dict/readings.tsv）・ユーザー（データディレクトリの readings.tsv）・要求ごと（readings）の 3 つ。
  *   同じ語なら 要求 → ユーザー → 組み込み の順で優先する
@@ -23,11 +26,14 @@ export const normalizeSurface = (s: string): string => s.normalize('NFKC').trim(
 /** 照合のキー（大文字小文字を同一視） */
 export const surfaceKey = (s: string): string => normalizeSurface(s).toLowerCase();
 
-/** 全部大文字で 5 字以内（数字を含んでよい。先頭は英字）。綴りで読むので置き換えない */
+/** 全部大文字で 5 字以内（数字を含んでよい。先頭は英字） */
 export const isAcronym = (word: string): boolean => /^[A-Z][A-Z0-9]{0,4}$/.test(word);
 
-/** 読みとして受け付ける形（カタカナ・長音符・中黒・空白） */
-export const isReading = (s: string): boolean => /^[\p{Script=Katakana}ー・ ]+$/u.test(s) && /\p{Script=Katakana}/u.test(s);
+/** 全部大文字で 3 字以内（API, GPU）。ZEN-TTS が綴りで読むので未知語の候補にしない */
+const isSpelledAcronym = (word: string): boolean => /^[A-Z]{1,3}$/.test(word);
+
+/** 読みとして受け付ける形（全角カタカナ・長音符・中黒・空白。半角カナは不可） */
+export const isReading = (s: string): boolean => /^[\u30A1-\u30FA\u30FD\u30FEー・ ]+$/.test(s) && /[\u30A1-\u30FA]/.test(s);
 
 const ALNUM_RE = /[A-Za-z0-9]/;
 const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -39,14 +45,64 @@ const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 export const DOMAIN_RE =
   /(?<![A-Za-z0-9@.-])(?:[A-Za-z0-9-]+\.)+(?:com|net|org|io|ai|dev|app|jp|co|me|tv|gg|so|sh|xyz|info|cloud|tech)(?![A-Za-z0-9-])(?:\/[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]*)?/gi;
 
-/** surface 1 つの正規表現。空白は 1 つ以上の空白に。先頭が英数字なら前が英数字でないとき、末尾が英字なら後ろが英字でないとき（iPhone16 は当てる） */
+/** surface 1 つの正規表現。空白は 1 つ以上の空白（改行は含めない）に。先頭が英数字なら前が英数字でないとき、末尾が英字なら後ろが英字でないとき（iPhone16 は当てる） */
 const surfacePattern = (surface: string): string => {
-  const body = surface.split(' ').map(escapeRe).join('\\s+');
+  const body = surface.split(' ').map(escapeRe).join('[ \\t\\u3000]+');
   const head = ALNUM_RE.test(surface[0]!) ? '(?<![A-Za-z0-9])' : '';
   const last = surface.at(-1)!;
   const tail = /[A-Za-z]/.test(last) ? '(?![A-Za-z])' : /\d/.test(last) ? '(?![A-Za-z0-9])' : '';
   return `${head}${body}${tail}`;
 };
+
+/** 語の直後: 所有格 's は消す（Apple's → アップル）。-数字・-英字のハイフンは空白にする（Pixel-9 → ピクセル 9、Mac-mini → マック ミニ） */
+const SUFFIX = `(?:(['’]s(?![A-Za-z]))|(-(?=[A-Za-z0-9])))?`;
+
+/**
+ * 照合の候補を絞るための文字のキー。/iu で同じとみなす文字は必ず同じキーになる（逆は成り立たなくてよい）。
+ * ASCII は小文字（/iu で ASCII と同じになる非 ASCII は K（ケルビン）と ſ だけ）。大文字小文字の無い文字はその文字。
+ * 大文字小文字のある非 ASCII（é・σ など）は null（照合のたびに /iu で比べる）
+ */
+const CASED_RE = /[\p{Changes_When_Casemapped}\p{Changes_When_Casefolded}]/u;
+const SPACE_RE = /[ \t\u3000]/;
+/** 語の間の空白（surfacePattern の [ \t\u3000]）はどれも ' '。改行などほかの空白は大文字小文字の無い文字と同じ扱い */
+const charKey = (ch: string): string | null => {
+  if (SPACE_RE.test(ch)) return ' ';
+  if (ch.length === 1 && ch.charCodeAt(0) < 0x80) return ch.toLowerCase();
+  if (ch === 'K') return 'k';
+  if (ch === 'ſ') return 's';
+  return CASED_RE.test(ch) ? null : ch;
+};
+const ASCII_KEYS = Array.from({ length: 0x80 }, (_, c) => charKey(String.fromCharCode(c)));
+/** 非 ASCII の charKey の控え（大きくなりすぎたら捨てる） */
+const charKeys = new Map<string, string | null>();
+const charKeyCached = (ch: string): string | null => {
+  let key = charKeys.get(ch);
+  if (key === undefined) {
+    if (charKeys.size >= 50_000) charKeys.clear();
+    charKeys.set(ch, (key = charKey(ch)));
+  }
+  return key;
+};
+/** s の位置 i の文字（サロゲートペアは 2 単位で 1 文字。/u と同じ） */
+const charAt = (s: string, i: number): string => {
+  const c = s.charCodeAt(i);
+  if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+    const d = s.charCodeAt(i + 1);
+    if (d >= 0xdc00 && d <= 0xdfff) return s.slice(i, i + 2);
+  }
+  return s[i]!;
+};
+const keyOf = (ch: string): string | null => {
+  const c = ch.charCodeAt(0);
+  return ch.length === 1 && c < 0x80 ? ASCII_KEYS[c]! : charKeyCached(ch);
+};
+
+/**
+ * surface の木。辺は charKey（大文字小文字のある非 ASCII は cased に元の文字のまま）。空白は ' ' 1 つ（文の空白の並びに当たる）。
+ * free: この下に、前が英数字でもよい（先頭が英数字でない）surface がある
+ */
+type TrieNode = { next: Map<string, TrieNode>; cased: [string, TrieNode][]; ends: number[]; free: boolean };
+const trieNode = (): TrieNode => ({ next: new Map(), cased: [], ends: [], free: false });
 
 /** 英単語の候補（英字の並び。. ' - でつながる英字は 1 語） */
 const WORD_RE = /(?<![A-Za-z0-9])[A-Za-z]+(?:['’.-][A-Za-z]+)*(?![A-Za-z])/g;
@@ -67,7 +123,7 @@ export type Readings = {
   apply: (text: string) => string;
   /** texts で実際に当たった語（キー → 読み。当たった順） */
   hits: (texts: readonly string[]) => Hit[];
-  /** 辞書に無い、小文字を含む英単語（所有格 's は落とす）。多い順 */
+  /** 辞書に無い英単語（所有格 's は落とす。全部大文字 3 字以内は除く）。多い順 */
   unknownWords: (texts: readonly string[]) => UnknownWord[];
 };
 
@@ -83,38 +139,175 @@ export const compileReadings = (rows: readonly ReadingRow[]): Readings => {
     const key = surface.toLowerCase();
     known.add(key);
     const reading = row.reading.trim();
-    if (!isReading(reading) || isAcronym(surface)) continue;
+    if (!isReading(reading)) continue;
     const rank = SOURCE_RANK[row.source] ?? 3;
     const prev = chosen.get(key);
     if (!prev || rank <= prev.rank) chosen.set(key, { surface, reading, source: row.source, rank });
   }
   const sorted = [...chosen.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   const version = sha256(sorted.map(([key, e]) => `${key}\t${e.reading}`));
+  // 照合の優先順（長い surface から。同じ長さならキーの順）
   const byLength = sorted.map(([, e]) => e.surface).sort((a, b) => b.length - a.length);
-  // 語の直後: 所有格 's は消す（Apple's → アップル）。-数字・-英字のハイフンは空白にする（Pixel-9 → ピクセル 9、Mac-mini → マック ミニ）
-  const re = byLength.length
-    ? new RegExp(
-        `(${URL_RE.source})|(${EMAIL_RE.source})|(${DOMAIN_RE.source})|(${byLength.map(surfacePattern).join('|')})` +
-          `(?:(['’]s(?![A-Za-z]))|(-(?=[A-Za-z0-9])))?`,
-        'giu',
-      )
-    : null;
+
+  /*
+   * 照合は「URL・メール | ドットを含む surface | ドメイン | ほかの surface（それぞれ優先順）」を 1 本の正規表現（giu）で当てるのと同じ結果にする。
+   * surface の数 × 位置の数だけ正規表現を試すと遅い（surface 200 語 × 2,000 字で数秒）ので、
+   * 各位置で surface の木をたどって当たりうる語だけに絞り、その語の正規表現（同じ形・同じフラグ）で優先順に確かめる
+   */
+  const urlEmailRe = new RegExp(`(${URL_RE.source})|(${EMAIL_RE.source})`, 'giu');
+  const domainRe = new RegExp(DOMAIN_RE.source, 'giu');
+  // 大文字小文字のある非 ASCII 文字どうしを /iu で比べた結果
+  const casedEq = new Map<string, Map<string, boolean>>();
+  const sameCased = (a: string, b: string): boolean => {
+    let row = casedEq.get(a);
+    if (!row) casedEq.set(a, (row = new Map()));
+    let eq = row.get(b);
+    if (eq === undefined) row.set(b, (eq = new RegExp(`^${escapeRe(a)}$`, 'iu').test(b)));
+    return eq;
+  };
+
+  /**
+   * surfaces（優先順）のどれかを位置 p から当てる関数。source は surface 1 つの正規表現（1 つ目の括弧が語）。
+   * 返すのは優先順で最初に当たったものの match。無ければ null
+   */
+  const surfaceMatcher = (surfaces: readonly string[], source: (surface: string) => string): ((s: string, p: number) => RegExpExecArray | null) => {
+    const root = trieNode();
+    const needsHead = surfaces.map(s => ALNUM_RE.test(s[0]!));
+    for (const [i, surface] of surfaces.entries()) {
+      let node = root;
+      for (const ch of surface) {
+        const key = keyOf(ch);
+        let child: TrieNode | undefined;
+        if (key === null) {
+          child = node.cased.find(([c]) => c === ch)?.[1];
+          if (!child) node.cased.push([ch, (child = trieNode())]);
+        } else {
+          child = node.next.get(key);
+          if (!child) node.next.set(key, (child = trieNode()));
+        }
+        node = child;
+        if (!needsHead[i]) node.free = true;
+      }
+      node.ends.push(i);
+    }
+    const surfaceRes = new Map<number, RegExp>();
+    const surfaceRe = (i: number): RegExp => {
+      let re = surfaceRes.get(i);
+      if (!re) surfaceRes.set(i, (re = new RegExp(source(surfaces[i]!), 'iuy')));
+      return re;
+    };
+
+    /** node から s の位置 i 以降をたどり、当たりうる surface を candidates に足す。prevAlnum: 照合の始まりの前が英数字 */
+    const walk = (s: string, node: TrieNode, i: number, prevAlnum: boolean, candidates: number[]): void => {
+      for (;;) {
+        for (const e of node.ends) if (!(prevAlnum && needsHead[e])) candidates.push(e);
+        if (i >= s.length) return;
+        const c = s.charCodeAt(i);
+        const ch = c < 0x80 ? '' : charAt(s, i);
+        const key = c < 0x80 ? ASCII_KEYS[c]! : charKeyCached(ch);
+        let j = i + (c < 0x80 ? 1 : ch.length);
+        if (key === ' ') while (j < s.length && keyOf(s[j]!) === ' ') j++;
+        let child: TrieNode | undefined;
+        if (key !== null) {
+          child = node.next.get(key);
+        } else {
+          // 大文字小文字のある非 ASCII は当たる辺が複数ありうる（2 つ目からは別にたどる）
+          for (const [edge, n] of node.cased) {
+            if ((prevAlnum && !n.free) || !sameCased(edge, ch)) continue;
+            if (!child) child = n;
+            else walk(s, n, j, prevAlnum, candidates);
+          }
+        }
+        if (!child || (prevAlnum && !child.free)) return;
+        node = child;
+        i = j;
+      }
+    };
+
+    return (s, p) => {
+      if (surfaces.length === 0) return null;
+      // 先頭が英数字の surface は、前が英数字なら当たらない（surfacePattern の head）
+      const prevAlnum = p > 0 && ALNUM_RE.test(s[p - 1]!);
+      const candidates: number[] = [];
+      walk(s, root, p, prevAlnum, candidates);
+      if (candidates.length === 0) return null;
+      candidates.sort((a, b) => a - b);
+      for (const e of candidates) {
+        const re = surfaceRe(e);
+        re.lastIndex = p;
+        const m = re.exec(s);
+        if (m) return m;
+      }
+      return null;
+    };
+  };
+
+  // ドットを含む surface（Character.AI）はドメインより先に試す。ただし長いドメインの一部（character.ai.example.com）は除く。
+  // それ以外はドメインの後（example.com の example は当てない）。ドットを含む surface には所有格・ハイフンの規則を付けない
+  const dottedAt = surfaceMatcher(
+    byLength.filter(s => s.includes('.')),
+    s => `(?<![.@])(${surfacePattern(s)})(?!\\.[A-Za-z0-9])`,
+  );
+  const plainAt = surfaceMatcher(
+    byLength.filter(s => !s.includes('.')),
+    s => `(${surfacePattern(s)})${SUFFIX}`,
+  );
 
   /** 置き換え。onHit に当たった語を渡す */
   const replace = (text: string, onHit?: (key: string, reading: string) => void): string => {
     const nfkc = text.normalize('NFKC');
-    if (!re) return nfkc;
-    return nfkc.replace(
-      re,
-      (m: string, url?: string, email?: string, domain?: string, word?: string, _possessive?: string, hyphen?: string) => {
-        if (url || email || domain || !word || isAcronym(word)) return m;
-        const key = word.replace(/\s+/g, ' ').toLowerCase();
-        const e = chosen.get(key);
-        if (!e) return m;
-        onHit?.(key, e.reading);
-        return hyphen ? `${e.reading} ` : e.reading;
-      },
-    );
+    if (!byLength.length) return nfkc;
+    let out = '';
+    let copied = 0;
+    let p = 0;
+    // p 以降で最初の URL・メールと、最初のドメイン（undefined はまだ探していない）
+    let special: RegExpExecArray | null | undefined;
+    let domain: RegExpExecArray | null | undefined;
+    while (p < nfkc.length) {
+      if (special === undefined || (special && special.index < p)) {
+        urlEmailRe.lastIndex = p;
+        special = urlEmailRe.exec(nfkc);
+      }
+      if (domain === undefined || (domain && domain.index < p)) {
+        domainRe.lastIndex = p;
+        domain = domainRe.exec(nfkc);
+      }
+      const stop = special ? special.index : nfkc.length;
+      let m: RegExpExecArray | null = null;
+      // 同じ位置なら ドットを含む surface → ドメイン → ほかの surface の順
+      for (; p < stop; p += nfkc.codePointAt(p)! > 0xffff ? 2 : 1) {
+        if ((m = dottedAt(nfkc, p))) break;
+        if (domain && domain.index === p) break;
+        if ((m = plainAt(nfkc, p))) break;
+      }
+      if (m) {
+        const whole = m[0];
+        const [, word, , hyphen] = m;
+        let replacement = whole;
+        if (word) {
+          const key = word.replace(/[ \t　]+/g, ' ').toLowerCase();
+          const e = chosen.get(key);
+          if (e) {
+            onHit?.(key, e.reading);
+            replacement = hyphen ? `${e.reading} ` : e.reading;
+          }
+        }
+        out += nfkc.slice(copied, p) + replacement;
+        p = copied = p + whole.length;
+        continue;
+      }
+      if (p < stop) {
+        // ドメインはそのまま
+        p = domain!.index + domain![0].length;
+        domain = undefined;
+        continue;
+      }
+      if (!special) break;
+      // URL・メールはそのまま
+      p = special.index + special[0].length;
+      special = undefined;
+    }
+    return out + nfkc.slice(copied);
   };
 
   const apply = (text: string): string => replace(text);
@@ -131,7 +324,7 @@ export const compileReadings = (rows: readonly ReadingRow[]): Readings => {
       const rest = apply(text).replace(URL_RE, ' ').replace(EMAIL_RE, ' ').replace(DOMAIN_RE, ' ');
       for (const [match] of rest.matchAll(WORD_RE)) {
         const word = match.replace(/['’]s$/, '');
-        if (word.length < 2 || !/[a-z]/.test(word) || isAcronym(word)) continue;
+        if (word.length < 2 || isSpelledAcronym(word)) continue;
         const key = word.toLowerCase();
         if (known.has(key)) continue;
         const hit = counts.get(key);

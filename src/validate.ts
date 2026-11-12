@@ -84,7 +84,10 @@ export type ValidateContext = {
   maxChars: number;
 };
 
-const BITRATE_RE = /^([1-9]\d{1,2})k$/;
+const BITRATE_RE = /^([1-9]\d{0,2})k$/;
+
+/** 形式ごとのビットレートの範囲（k）。Opus（libopus）は 256k を超えると ffmpeg が失敗する */
+export const BITRATE_RANGES: Partial<Record<Format, readonly [number, number]>> = { opus: [6, 256], mp3: [8, 320], m4a: [8, 320] };
 
 /** text の字数（コードポイント） */
 export const charCount = (s: string): number => [...s].length;
@@ -118,7 +121,9 @@ export const validateSynthRequest = (raw: unknown, ctx: ValidateContext): SynthR
     if (!(format in DEFAULT_BITRATES)) throw invalid(`bitrate cannot be used with format ${format}`, 'bitrate');
     const b = checkString(body.bitrate, 'bitrate');
     const m = BITRATE_RE.exec(b);
-    if (!m || Number(m[1]) < 16 || Number(m[1]) > 320) throw invalid('bitrate must be between 16k and 320k (e.g. "128k")', 'bitrate');
+    const [min, max] = BITRATE_RANGES[format]!;
+    if (!m || Number(m[1]) < min || Number(m[1]) > max)
+      throw invalid(`bitrate for ${format} must be between ${min}k and ${max}k (e.g. "${DEFAULT_BITRATES[format]}")`, 'bitrate');
     bitrate = `${Number(m[1])}k`;
   }
 
@@ -136,9 +141,8 @@ export const validateSynthRequest = (raw: unknown, ctx: ValidateContext): SynthR
     for (const [surface, reading] of entries) {
       const field = `readings.${surface}`;
       checkSurface(surface, field);
-      if (typeof reading !== 'string' || !isReading(reading.trim()))
-        throw invalid(`${field} must be katakana (with ー・ and spaces)`, field);
-      readings[surface] = reading.trim();
+      if (typeof reading !== 'string') throw invalid(`${field} must be katakana (with ー・ and spaces)`, field);
+      readings[surface] = checkReading(reading, field);
     }
   }
 
@@ -163,13 +167,24 @@ export const validateSynthRequest = (raw: unknown, ctx: ValidateContext): SynthR
   };
 };
 
-/** 読み辞書の語の形（空でない、100 字以内、タブ・改行を含まない） */
-export const MAX_SURFACE_CHARS = 100;
+/** 読み辞書の語（surface）と読みの字数の上限（要求ごとの readings とユーザー辞書の両方） */
+export const MAX_ENTRY_CHARS = 100;
 
+/** 読み辞書の語の形（空でない、MAX_ENTRY_CHARS 字以内、タブ・改行を含まない、# で始まらない） */
 export const checkSurface = (surface: string, field: string): string => {
   const s = normalizeSurface(surface);
   if (!s) throw invalid(`${field}: surface must not be empty`, field);
-  if (charCount(s) > MAX_SURFACE_CHARS) throw invalid(`${field}: surface must be at most ${MAX_SURFACE_CHARS} characters`, field);
+  if (charCount(s) > MAX_ENTRY_CHARS) throw invalid(`${field}: surface must be at most ${MAX_ENTRY_CHARS} characters`, field);
   if (/[\t\r\n]/.test(surface)) throw invalid(`${field}: surface must not contain tabs or line breaks`, field);
+  // readings.tsv では # で始まる行はコメントになり、再起動で消える
+  if (s.startsWith('#')) throw invalid(`${field}: surface must not start with #`, field);
   return s;
+};
+
+/** 読みの形（全角カタカナ・長音符・中黒・空白、MAX_ENTRY_CHARS 字以内）。前後の空白を落として返す */
+export const checkReading = (reading: string, field: string): string => {
+  const r = reading.trim();
+  if (!isReading(r)) throw invalid(`${field} must be katakana (with ー・ and spaces)`, field);
+  if (charCount(r) > MAX_ENTRY_CHARS) throw invalid(`${field} must be at most ${MAX_ENTRY_CHARS} characters`, field);
+  return r;
 };
