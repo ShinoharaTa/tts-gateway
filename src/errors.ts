@@ -4,10 +4,14 @@
 
 export type ErrorCode =
   | 'invalid_request'
+  | 'bad_request'
   | 'unauthorized'
   | 'forbidden'
+  | 'forbidden_origin'
   | 'not_found'
+  | 'method_not_allowed'
   | 'conflict'
+  | 'misdirected_request'
   | 'text_too_long'
   | 'unsupported_media_type'
   | 'model_not_installed'
@@ -23,6 +27,8 @@ export class ApiError extends Error {
   readonly field: string | undefined;
   /** 429 の Retry-After（秒） */
   retryAfterSec: number | undefined;
+  /** 405 の Allow */
+  allow: string | undefined;
 
   constructor(status: number, code: ErrorCode, message: string, field?: string) {
     super(message);

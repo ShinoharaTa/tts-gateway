@@ -4,6 +4,7 @@
  * - IPv4-mapped IPv6（::ffff:a.b.c.d）は IPv4 として判定する（デュアルスタックの socket が返す形）
  * - listen 先のアドレスがまだ無い（EADDRNOTAVAIL。起動直後の Tailscale など）ときは 5 秒ごとに再試行し、
  *   ほかのアドレスの待ち受けは止めない
+ * - 許可リスト外の接続元は connection の時点でソケットを閉じる（HTTP 層の 403 は server.ts に残す）
  */
 import { createServer, type RequestListener, type Server } from 'node:http';
 
@@ -111,6 +112,20 @@ export const inCidr = (ip: { family: 4 | 6; bytes: Uint8Array }, cidr: Cidr): bo
   return true;
 };
 
+/** 127.0.0.0/8 か ::1（IPv4-mapped を含む） */
+export const isLoopback = (address: string): boolean => {
+  const ip = parseIp(address);
+  if (!ip) return false;
+  if (ip.family === 4) return ip.bytes[0] === 127;
+  return ip.bytes.subarray(0, 15).every(x => x === 0) && ip.bytes[15] === 1;
+};
+
+/** 未指定アドレス（0.0.0.0・::・::ffff:0.0.0.0 など、全アドレスで待ち受ける形） */
+export const isUnspecified = (address: string): boolean => {
+  const ip = parseIp(address);
+  return !!ip && ip.bytes.every(x => x === 0);
+};
+
 /** 接続元が許可リストに入るか。解釈できないアドレスは入らない */
 export const isAllowed = (address: string | undefined, cidrs: readonly Cidr[]): boolean => {
   if (!address) return false;
@@ -122,16 +137,29 @@ export const RETRY_LISTEN_MS = 5000;
 
 export type Listening = { servers: Server[]; close: () => Promise<void> };
 
+export type ListenOptions = {
+  /** 指定すると、外の接続元は connection の時点で閉じる */
+  allowCidrs?: readonly Cidr[];
+  maxConnections?: number;
+  log?: (msg: string) => void;
+  /** 再試行中に EADDRNOTAVAIL 以外のエラーが起きたとき（起動はもう終わっているので reject できない） */
+  onFatal?: (e: Error) => void;
+  /** テスト用: 再試行の間隔 */
+  retryMs?: number;
+};
+
+/** 遅いクライアントに接続を握られ続けないための時間の上限 */
+const HEADERS_TIMEOUT_MS = 10_000;
+const REQUEST_TIMEOUT_MS = 30_000;
+const KEEP_ALIVE_TIMEOUT_MS = 5_000;
+
 /**
  * hosts のそれぞれに同じ handler で listen する。EADDRNOTAVAIL は 5 秒ごとに再試行（その間も起動は続ける）。
- * ほかのエラー（EADDRINUSE など）は reject（作った server は閉じる）
+ * ほかのエラー（EADDRINUSE など）は reject（作った server は閉じる）。再試行中に起きたら log して onFatal
  */
-export const listenAll = async (
-  handler: RequestListener,
-  hosts: readonly string[],
-  port: number,
-  log: (msg: string) => void = console.error,
-): Promise<Listening> => {
+export const listenAll = async (handler: RequestListener, hosts: readonly string[], port: number, opts: ListenOptions = {}): Promise<Listening> => {
+  const log = opts.log ?? console.error;
+  const retryMs = opts.retryMs ?? RETRY_LISTEN_MS;
   const servers: Server[] = [];
   const timers = new Set<NodeJS.Timeout>();
   let closed = false;
@@ -155,6 +183,16 @@ export const listenAll = async (
         host =>
           new Promise<void>((resolve, reject) => {
             const server = createServer(handler);
+            server.headersTimeout = HEADERS_TIMEOUT_MS;
+            server.requestTimeout = REQUEST_TIMEOUT_MS;
+            server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
+            if (opts.maxConnections !== undefined) server.maxConnections = opts.maxConnections;
+            const cidrs = opts.allowCidrs;
+            if (cidrs) {
+              server.on('connection', socket => {
+                if (!isAllowed(socket.remoteAddress, cidrs)) socket.destroy();
+              });
+            }
             servers.push(server);
             let first = true;
             const attempt = (): void => {
@@ -162,15 +200,20 @@ export const listenAll = async (
               const onError = (e: NodeJS.ErrnoException): void => {
                 server.off('listening', onListening);
                 if (e.code === 'EADDRNOTAVAIL') {
-                  if (first) log(`listen ${host}:${port}: address not available yet, retrying every ${RETRY_LISTEN_MS / 1000}s`);
+                  if (first) log(`listen ${host}:${port}: address not available yet, retrying every ${retryMs / 1000}s`);
                   first = false;
                   const t = setTimeout(() => {
                     timers.delete(t);
                     attempt();
-                  }, RETRY_LISTEN_MS);
+                  }, retryMs);
                   timers.add(t);
                   resolve();
-                } else reject(e);
+                } else if (first) reject(e);
+                else {
+                  // 起動時の Promise はもう resolve 済み。握りつぶさずに知らせる
+                  log(`listen ${host}:${port}: ${e.message}`);
+                  opts.onFatal?.(e);
+                }
               };
               const onListening = (): void => {
                 server.off('error', onError);

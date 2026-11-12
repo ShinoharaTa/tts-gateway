@@ -3,10 +3,13 @@
 機械可読な仕様は [`openapi.yaml`](../openapi.yaml)（OpenAPI 3.1）。両者の内容は一致させる（食い違いはバグ）。
 
 - ベース URL: `http://<host>:<port>`（既定ポート 8710）
-- 文字コード: UTF-8。リクエスト本文は `Content-Type: application/json` のみ受け付ける（それ以外は 415）。
-- 認証: 環境変数 `TTS_TOKEN` を設定したときだけ、`/healthz` と設定画面の静的ファイル（`/admin/`。画面で入力したトークンを API の呼び出しに付ける）以外で `Authorization: Bearer <TTS_TOKEN>` が必須。
+- 文字コード: UTF-8。リクエスト本文は `Content-Type: application/json` のみ受け付ける（それ以外は 415）。JSON を受ける `POST` / `PUT` は本文が空でも `Content-Type` が違えば 415。本文の上限は 1MB（超えたら 400）。
+- 認証: 環境変数 `TTS_TOKEN` を設定したときだけ、`/healthz` と設定画面の静的ファイル（`/admin/`。画面で入力したトークンを API の呼び出しに付ける）以外で `Authorization: Bearer <TTS_TOKEN>` が必須。`TTS_ADMIN_TOKEN` でも通る。
   `/v1/admin/*` は `TTS_ADMIN_TOKEN` を設定したときだけ、その値が必須（未設定なら `TTS_TOKEN` の規則に従う）。
+  認証はパスの有無より先に行う（トークンが要る構成では、未定義のパス・未対応のメソッドも未認証なら 401）。
 - 接続元: `TTS_ALLOW_CIDRS` に入らない接続元は 403（`forbidden`）。
+- Host: `Host` ヘッダが `TTS_HOSTS` の各アドレス:`TTS_PORT`（IPv6 は `[::1]:8710` の形。ポート 80 ならポート無しも可）、`127.0.0.1`・`::1` で待ち受けるときの `localhost:<port>`、`TTS_ALLOWED_HOSTS` のホスト名（ポートは問わない）以外なら全パスで 421（`misdirected_request`）。DNS rebinding 対策。
+- Origin: `GET` / `HEAD` / `OPTIONS` 以外で `Origin` ヘッダがあり、その host（ポート含む）が上の Host の許可に入らなければ 403（`forbidden_origin`）。`Origin: null` も 403。`Origin` が無い要求（curl など）は通す。
 - CORS ヘッダは返さない（別オリジンのブラウザからは呼べない。JSON 必須と合わせて CSRF 対策）。
 
 ## エラー形式
@@ -17,13 +20,17 @@
 
 | HTTP | code | 意味 |
 |---|---|---|
-| 400 | `invalid_request` | パラメータ不正（範囲外・型違い・未知のフィールド・そのエンジンが対応しないオプション） |
+| 400 | `invalid_request` | パラメータ不正（範囲外・型違い・未知のフィールド・そのエンジンが対応しないオプション・本文が 1MB 超） |
+| 400 | `bad_request` | リクエストターゲットが解釈できない（`GET //` など） |
 | 401 | `unauthorized` | トークンが無い・違う |
 | 403 | `forbidden` | 接続元が許可リスト外 |
+| 403 | `forbidden_origin` | `Origin` が許可外・`null`（`GET` / `HEAD` / `OPTIONS` 以外） |
 | 404 | `not_found` | エンジン・声・モデル・パスが無い |
+| 405 | `method_not_allowed` | パスはあるがメソッドが違う。`Allow` ヘッダ付き |
 | 409 | `conflict` | 同じ id のモデルがある・ダウンロード中 など |
 | 413 | `text_too_long` | `text` が上限（既定 2,000 字）を超えた |
-| 415 | `unsupported_media_type` | JSON 以外の本文 |
+| 415 | `unsupported_media_type` | JSON 以外の本文（JSON を受ける `POST` / `PUT` は本文が空でも） |
+| 421 | `misdirected_request` | `Host` ヘッダが許可外・無い |
 | 422 | `model_not_installed` | 声は登録済みだが重みが未取得 |
 | 422 | `unprocessable_text` | 読み上げられない長さの語が含まれる（1 回の合成の上限を超える文を割り直しても収まらない） |
 | 429 | `queue_full` | 待ち行列が満杯。`Retry-After` ヘッダ（秒）付き |
@@ -35,9 +42,9 @@
 
 ---
 
-## GET /healthz
+## GET /healthz（HEAD も可）
 
-モデルを読まずに返す。認証不要。
+モデルを読まずに返す。認証不要。`HEAD` は 200 で本文なし。
 
 ```json
 { "status": "ok", "version": "0.1.0" }

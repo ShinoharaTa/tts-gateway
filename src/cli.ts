@@ -19,20 +19,26 @@ const USAGE = `usage:
 const serve = async (): Promise<void> => {
   const config = loadConfig();
   const app = await createApp(config);
-  const listening = await listenAll(createHandler(app), config.hosts, config.port);
+  let stopping = false;
+  let listening: Awaited<ReturnType<typeof listenAll>> | undefined;
+  const stop = async (reason: string, code = 0): Promise<void> => {
+    if (stopping) return;
+    stopping = true;
+    console.error(`${reason}: stopping`);
+    await listening?.close();
+    await app.close();
+    process.exit(code);
+  };
+  listening = await listenAll(createHandler(app), config.hosts, config.port, {
+    allowCidrs: config.allowCidrs,
+    maxConnections: config.maxConnections,
+    // 再試行中の EADDRINUSE などは起動失敗として終了する（systemd の Restart=on-failure に任せる）
+    onFatal: () => void stop('listen failed', 1),
+  });
   console.error(`tts-gateway: data ${config.dataDir}, cache ${config.cacheDir}`);
   const ffmpeg = await app.ffmpeg.get();
   if (!ffmpeg.available)
     console.error(`ffmpeg is not available (${ffmpeg.path}: ${ffmpeg.reason}): only wav at the engine's sample rate can be returned`);
-  let stopping = false;
-  const stop = async (signal: string): Promise<void> => {
-    if (stopping) return;
-    stopping = true;
-    console.error(`${signal}: stopping`);
-    await listening.close();
-    await app.close();
-    process.exit(0);
-  };
   process.on('SIGINT', () => void stop('SIGINT'));
   process.on('SIGTERM', () => void stop('SIGTERM'));
 };

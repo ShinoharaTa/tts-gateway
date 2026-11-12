@@ -22,6 +22,13 @@ CPUQuota=150%
 # MemoryHigh=800M MemoryMax=1G を勧める（docs/deployment.md「速度とメモリの目安」）
 MemoryHigh=600M
 MemoryMax=800M
+# 強化。書けるのはデータとキャッシュのディレクトリだけ（TTS_DATA_DIR / TTS_CACHE_DIR を変えたらここも合わせる）
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=-%h/.local/share/tts-gateway -%h/.cache/tts-gateway
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
 
 [Install]
 WantedBy=default.target
