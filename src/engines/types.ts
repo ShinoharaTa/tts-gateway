@@ -2,6 +2,7 @@
  * エンジンの共通インターフェース（docs/design.md「Engine インターフェース」）。
  * 文分割・無音・連結・エンコードは共通層（synthesize.ts）で、エンジンは 1 文を PCM にするだけ。
  */
+import { ApiError } from '../errors.ts';
 import type { ModelRecord } from '../models/registry.ts';
 
 export type Credit = { ja: string; en: string; url: string };
@@ -22,6 +23,17 @@ export type EngineStatus = {
   processes: { slot: number; voice: string; pid: number; state: 'starting' | 'idle' | 'busy'; rssBytes: number | null }[];
   idleUnloadSec: number;
 };
+
+/**
+ * 1 回の合成の上限（字数・音素数など）を超えた文。合成プロセスは正常のまま。
+ * 共通層（synthesize.ts）は文を割って合成し直し、割り切れなければ 422 unprocessable_text にする
+ */
+export class SentenceTooLongError extends ApiError {
+  constructor(message: string) {
+    super(422, 'unprocessable_text', message);
+    this.name = 'SentenceTooLongError';
+  }
+}
 
 export interface Engine {
   id: string;
@@ -44,7 +56,7 @@ export interface Engine {
   /** 取得後の検査。読めなければ例外 */
   verifyModel(path: string): Promise<{ voiceId: string }>;
   /**
-   * 1 文を合成する（sampleRate のモノラル float32）。slot は待ち行列のスロット（0〜TTS_CONCURRENCY-1）で、
+   * 1 文を合成する（sampleRate のモノラル float32）。1 回の合成の上限を超える文は SentenceTooLongError。slot は待ち行列のスロット（0〜TTS_CONCURRENCY-1）で、
    * 同じ slot には同時に 1 要求しか来ない。合成プロセスを持つエンジンは slot ごとにプロセスを分ける
    */
   synthesize(sentence: string, voice: ModelRecord, opts: EngineOptions, signal: AbortSignal, slot: number): Promise<Float32Array>;
