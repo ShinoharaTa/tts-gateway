@@ -21,6 +21,7 @@ const serve = async (): Promise<void> => {
   const app = await createApp(config);
   const listening = await listenAll(createHandler(app), config.hosts, config.port);
   console.error(`tts-gateway: data ${config.dataDir}, cache ${config.cacheDir}`);
+  if (!app.ffmpeg.available) console.error(`ffmpeg is not available (${app.ffmpeg.path}): only wav at the engine's sample rate can be returned`);
   let stopping = false;
   const stop = async (signal: string): Promise<void> => {
     if (stopping) return;

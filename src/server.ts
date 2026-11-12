@@ -9,6 +9,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFile, rm } from 'node:fs/promises';
 import type { IncomingMessage, RequestListener, ServerResponse } from 'node:http';
 import { join } from 'node:path';
+import { probeFfmpeg, type FfmpegStatus } from './audio/encode.ts';
 import { AudioCache } from './cache.ts';
 import { VERSION, type Config } from './config.ts';
 import { createEngines, MODEL_EXTS, type EngineDeps } from './engines/index.ts';
@@ -35,6 +36,8 @@ export type App = {
   catalog: CatalogModel[];
   downloader: ModelDownloader;
   synth: Synthesizer;
+  /** 起動時に確かめた ffmpeg の有無 */
+  ffmpeg: FfmpegStatus;
   startedAt: number;
   close: () => Promise<void>;
 };
@@ -68,9 +71,11 @@ export const createApp = async (config: Config, o: AppOverrides = {}): Promise<A
     isHostAllowed: o.isHostAllowed,
     protocols: o.protocols,
   });
+  // ffmpeg が無くても起動は続ける（wav はそのまま返せる）
+  const ffmpeg = await probeFfmpeg(config.ffmpeg);
   const synth = new Synthesizer({
     engines, registry, settings, cache, queue, dictionary,
-    maxChars: config.maxChars, timeoutSec: config.timeoutSec, ffmpeg: config.ffmpeg,
+    maxChars: config.maxChars, timeoutSec: config.timeoutSec, ffmpeg: config.ffmpeg, ffmpegAvailable: ffmpeg.available,
   });
   settings.onChange(() => {
     void cache.evict().catch(e => console.error(`cache evict failed: ${(e as Error).message}`));
@@ -84,7 +89,7 @@ export const createApp = async (config: Config, o: AppOverrides = {}): Promise<A
     await downloader.cancelAll();
     await Promise.all([...engines.values()].map(e => e.close()));
   };
-  return { config, engines, registry, settings, cache, queue, dictionary, catalog, downloader, synth, startedAt: Date.now(), close };
+  return { config, engines, registry, settings, cache, queue, dictionary, catalog, downloader, synth, ffmpeg, startedAt: Date.now(), close };
 };
 
 // ---- 入出力 ----
@@ -219,6 +224,7 @@ const statusJson = (app: App): unknown => ({
   engines: [...app.engines.values()].map(e => e.status()),
   queue: app.queue.stats(),
   cache: app.cache.stats(),
+  ffmpeg: app.ffmpeg,
   memory: { rssBytes: process.memoryUsage.rss() },
 });
 

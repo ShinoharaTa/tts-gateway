@@ -27,7 +27,7 @@
 | 422 | `model_not_installed` | 声は登録済みだが重みが未取得 |
 | 429 | `queue_full` | 待ち行列が満杯。`Retry-After` ヘッダ（秒）付き |
 | 500 | `internal_error` | 想定外の失敗 |
-| 503 | `engine_unavailable` | モデル読み込み・合成プロセスの失敗 |
+| 503 | `engine_unavailable` | モデル読み込み・合成プロセスの失敗。ffmpeg が無い（起動できない）ときに ffmpeg の要る要求（`wav` 以外、またはリサンプルの要る `wav`） |
 | 504 | `timeout` | 合成が時間内（既定 60 秒）に終わらなかった |
 
 **未知のフィールドは 400**（打ち間違いを黙って無視しない）。
@@ -178,9 +178,13 @@ curl -sS -X POST http://127.0.0.1:8710/v1/synthesize \
   "engines": [{ "id": "zen-tts", "loaded": "marine", "kernel": "wasm", "process": { "pid": 1234, "rssBytes": 300000000 }, "idleUnloadSec": 600 }],
   "queue": { "running": 1, "waiting": 0, "max": 8, "concurrency": 1 },
   "cache": { "entries": 12, "bytes": 1048576, "maxBytes": 524288000 },
+  "ffmpeg": { "available": true, "path": "ffmpeg", "version": "7.0.2" },
   "memory": { "rssBytes": 80000000 }
 }
 ```
+
+`ffmpeg` は起動時に `FFMPEG -version` を 1 回試した結果（`path` は `FFMPEG` の値、`version` は出力の 1 行目から取った版、取れなければ `null`）。
+`available` が `false` なら、ffmpeg の要る要求は ffmpeg を起動せずに 503 `engine_unavailable` を返す（起動後に入れても再起動するまで変わらない）。
 
 ### GET /v1/admin/settings / PUT /v1/admin/settings
 

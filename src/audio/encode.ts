@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ApiError } from '../errors.ts';
 import { toS16, wavBuffer } from './pcm.ts';
 
 export const FORMATS = ['wav', 'mp3', 'opus', 'm4a', 'flac'] as const;
@@ -43,10 +44,45 @@ const CODEC_ARGS: Record<Format, (bitrate?: string) => string[]> = {
   flac: () => ['-c:a', 'flac', '-f', 'flac'],
 };
 
+/** その形式・サンプルレートにするのに ffmpeg が要るか */
+export const needsFfmpeg = (format: Format, sampleRate: number, inputRate: number): boolean =>
+  !(format === 'wav' && outputSampleRate(format, sampleRate) === inputRate);
+
+/** ffmpeg が起動できないときの 503 */
+export const ffmpegUnavailable = (ffmpeg: string): ApiError =>
+  new ApiError(503, 'engine_unavailable', `ffmpeg is not available (${ffmpeg})`);
+
+export type FfmpegStatus = { available: boolean; path: string; version: string | null };
+
+/** 起動時の確認: `ffmpeg -version` が 0 で終われば使える。版は 1 行目の "ffmpeg version X" の X */
+export const probeFfmpeg = (ffmpeg: string, timeoutMs = 5000): Promise<FfmpegStatus> =>
+  new Promise(resolve => {
+    let stdout = '';
+    let done = false;
+    const finish = (available: boolean): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      const first = stdout.split('\n', 1)[0] ?? '';
+      const version = available ? (/^ffmpeg version (\S+)/.exec(first)?.[1] ?? null) : null;
+      resolve({ available, path: ffmpeg, version });
+    };
+    const proc = spawn(ffmpeg, ['-version'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    const timer = setTimeout(() => {
+      proc.kill('SIGKILL');
+      finish(false);
+    }, timeoutMs);
+    proc.stdout.on('data', (d: Buffer) => {
+      if (stdout.length < 4000) stdout += d.toString();
+    });
+    proc.on('error', () => finish(false));
+    proc.on('close', code => finish(code === 0));
+  });
+
 /** pcm（inputRate のモノラル）を o.format にする */
 export const encode = async (pcm: Float32Array, inputRate: number, o: EncodeOptions): Promise<Buffer> => {
   const rate = outputSampleRate(o.format, o.sampleRate);
-  if (o.format === 'wav' && rate === inputRate) return wavBuffer(pcm, inputRate);
+  if (!needsFfmpeg(o.format, o.sampleRate, inputRate)) return wavBuffer(pcm, inputRate);
   const dir = await mkdtemp(join(tmpdir(), 'tts-gateway-enc-'));
   const out = join(dir, `out.${EXTENSIONS[o.format]}`);
   try {
@@ -68,7 +104,13 @@ const runFfmpeg = (ffmpeg: string, args: string[], input: Buffer): Promise<void>
     proc.stderr.on('data', (d: Buffer) => {
       if (stderr.length < 4000) stderr += d.toString();
     });
-    proc.on('error', e => reject(new Error(`ffmpeg (${ffmpeg}) failed to start: ${e.message}`)));
+    proc.on('error', (e: NodeJS.ErrnoException) =>
+      reject(
+        e.code === 'ENOENT' || e.code === 'EACCES'
+          ? ffmpegUnavailable(ffmpeg)
+          : new Error(`ffmpeg (${ffmpeg}) failed to start: ${e.message}`),
+      ),
+    );
     proc.on('close', code => (code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}: ${stderr.trim()}`))));
     proc.stdin.on('error', () => {});
     proc.stdin.end(input);

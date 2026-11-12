@@ -527,7 +527,7 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
     EngineUnavailable:
-      description: モデル読み込み・合成プロセスの失敗
+      description: モデル読み込み・合成プロセスの失敗、または ffmpeg が無い（ffmpeg の要る形式・サンプルレートのとき）
       content:
         application/json:
           schema:
@@ -1009,7 +1009,7 @@ components:
     Status:
       type: object
       additionalProperties: false
-      required: [version, uptimeSec, engines, queue, cache, memory]
+      required: [version, uptimeSec, engines, queue, cache, ffmpeg, memory]
       properties:
         version:
           type: string
@@ -1046,6 +1046,21 @@ components:
               type: integer
             maxBytes:
               type: integer
+        ffmpeg:
+          type: object
+          additionalProperties: false
+          required: [available, path, version]
+          description: 起動時に `-version` を 1 回試した結果。available が false なら ffmpeg の要る要求は 503
+          properties:
+            available:
+              type: boolean
+            path:
+              type: string
+              description: FFMPEG の値
+            version:
+              type: [string, 'null']
+              description: 出力の 1 行目から取った版
+              examples: ['7.0.2']
         memory:
           type: object
           additionalProperties: false
