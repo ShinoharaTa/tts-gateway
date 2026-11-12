@@ -76,6 +76,8 @@ const duration = sec => {
   return `${Math.floor(sec / 86400)} 日 ${Math.floor((sec % 86400) / 3600)} 時間`;
 };
 
+const PROCESS_STATE = { starting: '読み込み中', idle: '待機中', busy: '合成中' };
+
 const STATUS_LABEL = { pending: '未取得', downloading: 'ダウンロード中', verifying: '検査中', installed: 'インストール済み', error: 'エラー' };
 
 // ---- 状態 ----
@@ -88,14 +90,21 @@ const loadStatus = async () => {
     const s = await api('/v1/admin/status');
     $('version').textContent = `v${s.version}`;
     const e = s.engines.find(x => x.id === ENGINE) ?? s.engines[0];
+    // 合成プロセスはスロットごとに 1 行
+    const procs = e?.processes ?? [];
     const items = [
       ['稼働時間', duration(s.uptimeSec)],
-      ['読み込み中の声', e?.loaded ?? 'なし'],
+      ...(procs.length
+        ? procs.map(p => [
+            `合成プロセス ${p.slot + 1}`,
+            `${p.voice}（${PROCESS_STATE[p.state] ?? p.state}）・${mb(p.rssBytes)}`,
+          ])
+        : [['合成プロセス', 'なし']]),
       ['カーネル', e?.kernel ?? '—'],
-      ['合成プロセスのメモリ', e?.process ? mb(e.process.rssBytes) : '—'],
       ['サーバーのメモリ', mb(s.memory.rssBytes)],
       ['合成中 / 待ち', `${s.queue.running} / ${s.queue.waiting}（上限 ${s.queue.max}）`],
       ['キャッシュ', `${s.cache.entries} 件・${mb(s.cache.bytes)}`],
+      ['ffmpeg', s.ffmpeg.available ? (s.ffmpeg.version ?? 'あり') : 'なし（wav だけ使えます）'],
     ];
     $('status').replaceChildren(...items.map(([k, v]) => h('div', {}, h('dt', {}, k), h('dd', {}, v))));
     setMsg('status-msg', '');

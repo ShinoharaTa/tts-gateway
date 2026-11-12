@@ -84,7 +84,10 @@ export type ValidateContext = {
   maxChars: number;
 };
 
-const BITRATE_RE = /^([1-9]\d{1,2})k$/;
+const BITRATE_RE = /^([1-9]\d{0,2})k$/;
+
+/** 形式ごとのビットレートの範囲（k）。Opus（libopus）は 256k を超えると ffmpeg が失敗する */
+export const BITRATE_RANGES: Partial<Record<Format, readonly [number, number]>> = { opus: [6, 256], mp3: [8, 320], m4a: [8, 320] };
 
 /** text の字数（コードポイント） */
 export const charCount = (s: string): number => [...s].length;
@@ -118,7 +121,9 @@ export const validateSynthRequest = (raw: unknown, ctx: ValidateContext): SynthR
     if (!(format in DEFAULT_BITRATES)) throw invalid(`bitrate cannot be used with format ${format}`, 'bitrate');
     const b = checkString(body.bitrate, 'bitrate');
     const m = BITRATE_RE.exec(b);
-    if (!m || Number(m[1]) < 16 || Number(m[1]) > 320) throw invalid('bitrate must be between 16k and 320k (e.g. "128k")', 'bitrate');
+    const [min, max] = BITRATE_RANGES[format]!;
+    if (!m || Number(m[1]) < min || Number(m[1]) > max)
+      throw invalid(`bitrate for ${format} must be between ${min}k and ${max}k (e.g. "${DEFAULT_BITRATES[format]}")`, 'bitrate');
     bitrate = `${Number(m[1])}k`;
   }
 
