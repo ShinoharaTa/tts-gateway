@@ -3,7 +3,8 @@
  *
  * 親 → 子: { type: 'load', modelPath } / { type: 'speak', id, text, opts }
  * 子 → 親: { type: 'ready', kernel, voice, version } / { type: 'fatal', message } /
- *          { type: 'result', id, pcm, sampleRate } / { type: 'error', id, message }
+ *          { type: 'result', id, pcm, sampleRate } / { type: 'error', id, message, kind? }
+ * kind: 'sentence_too_long' は 1 回の合成の上限（字数・音素数・フレーム数）を超えた文（子はそのまま次の文を受ける）
  * serialization: 'advanced' なので Float32Array をそのまま送れる。
  */
 import { VERSION, ZenTtsNode, type SpeakOptions } from 'zen-tts/node';
@@ -17,6 +18,9 @@ const send = (m: unknown): void => {
 };
 
 const message = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/** zen-tts の上限超過（`own tts: 300 chars (max 256)`・`… phones (max 512)`・`… frames (max 2048)`） */
+const TOO_LONG_RE = /own tts: \d+ (?:chars|phones|frames) \(max \d+\)/;
 
 /** API のオプション名 → speak() のオプション名 */
 const speakOptions = (o: ZenTtsOptions): SpeakOptions => ({
@@ -51,7 +55,8 @@ process.on('message', async (m: LoadMsg | SpeakMsg) => {
       const r = await tts.speak(m.text, speakOptions(m.opts));
       send({ type: 'result', id: m.id, pcm: r.pcm, sampleRate: r.sampleRate });
     } catch (e) {
-      send({ type: 'error', id: m.id, message: message(e) });
+      const msg = message(e);
+      send({ type: 'error', id: m.id, message: msg, ...(TOO_LONG_RE.test(msg) ? { kind: 'sentence_too_long' } : {}) });
     }
   }
 });
