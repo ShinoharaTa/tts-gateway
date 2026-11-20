@@ -16,6 +16,7 @@ import { dirname } from 'node:path';
 import { once } from 'node:events';
 import { ApiError, conflict, invalid, notFound } from '../errors.ts';
 import type { Engine } from '../engines/types.ts';
+import { log } from '../log.ts';
 import type { ModelRecord, Registry } from './registry.ts';
 
 export const MAX_REDIRECTS = 5;
@@ -350,7 +351,7 @@ export class ModelDownloader {
         await reg.update(rec.engine, rec.id, { status: 'error', progress: null, error: (e as Error).message });
       } catch (e2) {
         // models.json を書けないときなど。ここで投げると unhandledRejection になる
-        console.error(`model ${rec.engine}/${rec.id}: failed to record the error: ${(e2 as Error).message}`);
+        log.error(`model ${rec.engine}/${rec.id}: failed to record the error: ${(e2 as Error).message}`);
       }
     }
   }

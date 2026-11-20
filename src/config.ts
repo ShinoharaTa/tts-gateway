@@ -6,6 +6,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { isIP } from 'node:net';
 import { fileURLToPath } from 'node:url';
+import { log } from './log.ts';
 import { isLoopback, isUnspecified, parseCidr, type Cidr } from './net.ts';
 
 /** リポジトリのルート（dict/・catalog/・public/ の場所） */
@@ -62,7 +63,7 @@ const PLACEHOLDER_TOKEN = 'change-me';
 const MIN_TOKEN_CHARS = 16;
 
 /** warn: 起動を止めない注意（1 件 1 行） */
-export const loadConfig = (env: Env = process.env, warn: (msg: string) => void = console.error): Config => {
+export const loadConfig = (env: Env = process.env, warn: (msg: string) => void = msg => log.warn(msg)): Config => {
   const home = env.HOME || homedir();
   const dataHome = env.XDG_DATA_HOME || join(home, '.local', 'share');
   const cacheHome = env.XDG_CACHE_HOME || join(home, '.cache');
@@ -71,8 +72,9 @@ export const loadConfig = (env: Env = process.env, warn: (msg: string) => void =
   if (hosts.length === 0) throw new Error('TTS_HOSTS is empty');
   for (const h of hosts) {
     if (!isIP(h)) throw new Error(`TTS_HOSTS must contain IP addresses only (got ${JSON.stringify(h)}; use 127.0.0.1 instead of localhost)`);
-    // 全アドレスで待ち受けるアドレス。公開しないため起動時エラーにする
-    if (isUnspecified(h)) throw new Error(`TTS_HOSTS must not contain ${h} (list each address to listen on)`);
+    // 全アドレスで待ち受けるアドレス。公開しないため、TTS_ALLOW_ANY_ADDRESS=1（コンテナ用）が無ければ起動時エラーにする
+    if (isUnspecified(h) && env.TTS_ALLOW_ANY_ADDRESS !== '1')
+      throw new Error(`TTS_HOSTS must not contain ${h} (list each address to listen on) (or set TTS_ALLOW_ANY_ADDRESS=1 when running in a container)`);
   }
 
   const allowCidrs = list(env.TTS_ALLOW_CIDRS ?? '127.0.0.1/32,::1/128').map(c => {

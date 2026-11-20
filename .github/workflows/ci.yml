@@ -1,0 +1,86 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.12.1
+      - run: npm ci
+      - run: npm test
+
+  # GitHub 上のコードだけからイメージを作り、コンテナとして動くことを確かめる（重みは取得しない）
+  docker:
+    runs-on: ubuntu-24.04
+    env:
+      IMAGE: tts-gateway:ci
+      TTS_TOKEN: ci-only-token-0123456789abcdef
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: docker build -t "$IMAGE" .
+      - name: Refuses to start without a token
+        run: |
+          if docker run --rm "$IMAGE"; then echo "started without a token"; exit 1; fi
+      - name: Start
+        run: |
+          docker volume create tts-data
+          docker run -d --name tts -p 127.0.0.1:8710:8710 -v tts-data:/data \
+            -e TTS_TOKEN -e APP_ENV=ci "$IMAGE"
+          for i in $(seq 1 30); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' tts)" = healthy ] && break
+            sleep 2
+          done
+          docker inspect -f '{{.State.Health.Status}}' tts | grep -x healthy
+      - name: Runs as non-root with ffmpeg
+        run: |
+          test "$(docker exec tts id -u)" != 0
+          curl -fsS -H "Authorization: Bearer $TTS_TOKEN" http://127.0.0.1:8710/v1/admin/status | tee status.json
+          jq -e '.ffmpeg.available == true' status.json
+      - name: HTTP API
+        run: |
+          curl -fsS http://127.0.0.1:8710/health | jq -e '.status == "ok"'
+          curl -fsS http://127.0.0.1:8710/health/live | jq -e '.status == "ok"'
+          curl -fsS http://127.0.0.1:8710/health/ready | jq -e '.status == "ok"'
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8710/v1/engines)" = 401
+          curl -fsS -H "Authorization: Bearer $TTS_TOKEN" http://127.0.0.1:8710/v1/engines | jq -e '.engines | length > 0'
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8710/admin/)" = 200
+          # プロキシが付ける Host は TTS_ALLOWED_HOSTS に無ければ 421
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: tts.example.com' http://127.0.0.1:8710/health)" = 421
+      - name: Data survives a restart and a new container
+        run: |
+          curl -fsS -X PUT -H "Authorization: Bearer $TTS_TOKEN" -H 'Content-Type: application/json' \
+            -d '{"reading":"シーアイ"}' http://127.0.0.1:8710/v1/admin/dictionary/CiProbeWord -o /dev/null
+          docker restart tts
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8710/health/ready -o /dev/null && break; sleep 1; done
+          curl -fsS -H "Authorization: Bearer $TTS_TOKEN" http://127.0.0.1:8710/v1/dictionary | grep -q CiProbeWord
+          docker logs tts > logs-1.txt 2>&1
+          docker rm -f tts
+          docker run -d --name tts -p 127.0.0.1:8710:8710 -v tts-data:/data -e TTS_TOKEN -e APP_ENV=ci "$IMAGE"
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8710/health/ready -o /dev/null && break; sleep 1; done
+          curl -fsS -H "Authorization: Bearer $TTS_TOKEN" http://127.0.0.1:8710/v1/dictionary | grep -q CiProbeWord
+      - name: Stops on SIGTERM with exit code 0
+        run: |
+          start=$(date +%s)
+          docker stop -t 20 tts
+          took=$(( $(date +%s) - start ))
+          code=$(docker inspect -f '{{.State.ExitCode}}' tts)
+          echo "exit code $code in ${took}s"
+          test "$code" = 0
+          test "$took" -lt 10
+      - name: Logs are JSON lines without the token
+        run: |
+          docker logs tts > logs-2.txt 2>&1
+          cat logs-1.txt logs-2.txt
+          cat logs-1.txt logs-2.txt | jq -e -s 'length > 0 and all(.[]; .time and .level and .service == "tts-gateway" and .env == "ci" and .msg)'
+          ! grep -q "$TTS_TOKEN" logs-1.txt logs-2.txt

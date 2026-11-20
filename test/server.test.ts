@@ -6,8 +6,13 @@ import { connect, type AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { loadConfig } from '../src/config.ts';
+import { configureLog, setLogSink } from '../src/log.ts';
 import { createApp, createHandler, type App } from '../src/server.ts';
 import { FakeEngine, installedModel, tempDir } from './helpers.ts';
+
+// アクセスログなどでテストの出力を埋めない（見るテストは captureLog で受ける）
+const silence = (): void => setLogSink(() => {});
+silence();
 
 type Ctx = { base: string; port: number; app: App; engine: FakeEngine; stop: () => Promise<void> };
 
@@ -678,5 +683,272 @@ test('synthesize: 合流中は 1 人が切断しても合成を続け、残っ�
     assert.equal(c.engine.calls.length, 2);
   } finally {
     await c.stop();
+  }
+});
+
+// ---- ヘルスチェック・リクエスト ID・アクセスログ ----
+
+/** json 形式のログを受ける。stop で元（出さない）に戻す */
+const captureLog = (level = 'info'): { lines: Record<string, unknown>[]; raw: string[]; stop: () => void } => {
+  const lines: Record<string, unknown>[] = [];
+  const raw: string[] = [];
+  configureLog({ LOG_FORMAT: 'json', LOG_LEVEL: level });
+  setLogSink((_stream, line) => {
+    raw.push(line);
+    lines.push(JSON.parse(line) as Record<string, unknown>);
+  });
+  return {
+    lines, raw,
+    stop: () => {
+      configureLog({});
+      silence();
+    },
+  };
+};
+
+/** アクセスログは応答の close で出るので、少し待つ */
+const waitFor = async (cond: () => boolean): Promise<void> => {
+  for (let i = 0; i < 100 && !cond(); i++) await new Promise(r => setTimeout(r, 10));
+  await new Promise(r => setTimeout(r, 20));
+};
+
+test('health: /health・/health/live・/health/ready は認証不要で 200、HEAD 可、POST は 405', async () => {
+  const c = await start({ TTS_TOKEN: 'u'.repeat(32), TTS_ADMIN_TOKEN: 'a'.repeat(32) });
+  try {
+    const host = `127.0.0.1:${c.port}`;
+    for (const path of ['/healthz', '/health', '/health/live', '/health/ready']) {
+      const r = await raw(c, 'GET', path, { Host: host });
+      assert.equal(r.status, 200, path);
+      assert.deepEqual(JSON.parse(r.body), { status: 'ok', version: '0.1.0' }, path);
+      assert.equal(r.headers['cache-control'], 'no-store');
+      const head = await raw(c, 'HEAD', path, { Host: host });
+      assert.equal(head.status, 200, path);
+      assert.equal(head.body, '');
+      const post = await raw(c, 'POST', path, { Host: host });
+      assert.equal(post.status, 405, path);
+      assert.equal(rawCode(post), 'method_not_allowed');
+      assert.equal(post.headers.allow, 'GET, HEAD', path);
+    }
+    // 認証が要るルートは今までどおり 401
+    assert.equal((await raw(c, 'GET', '/v1/engines', { Host: host })).status, 401);
+    // Host 検査は通常どおり
+    assert.equal((await raw(c, 'GET', '/health/ready', { Host: 'evil.example.com' })).status, 421);
+  } finally {
+    await c.stop();
+  }
+});
+
+test('health/ready: 終了処理中・データディレクトリに書けない・無いときは 503 と reason', async () => {
+  const c = await start();
+  try {
+    const host = `127.0.0.1:${c.port}`;
+    c.app.shuttingDown = true;
+    let r = await raw(c, 'GET', '/health/ready', { Host: host });
+    assert.equal(r.status, 503);
+    assert.deepEqual(JSON.parse(r.body), { status: 'unavailable', reason: 'shutting down' });
+    assert.equal(r.headers['retry-after'], undefined);
+    // live は終了処理中でも 200
+    assert.equal((await raw(c, 'GET', '/health/live', { Host: host })).status, 200);
+    c.app.shuttingDown = false;
+
+    await chmod(c.app.config.dataDir, 0o500);
+    try {
+      r = await raw(c, 'GET', '/health/ready', { Host: host });
+      assert.equal(r.status, 503);
+      assert.deepEqual(JSON.parse(r.body), { status: 'unavailable', reason: 'data directory is not writable' });
+      assert.equal((await raw(c, 'HEAD', '/health/ready', { Host: host })).status, 503);
+    } finally {
+      await chmod(c.app.config.dataDir, 0o700);
+    }
+    assert.equal((await raw(c, 'GET', '/health/ready', { Host: host })).status, 200);
+
+    await rm(c.app.config.dataDir, { recursive: true, force: true });
+    r = await raw(c, 'GET', '/health/ready', { Host: host });
+    assert.equal(r.status, 503);
+    assert.deepEqual(JSON.parse(r.body), { status: 'unavailable', reason: 'data directory is not writable' });
+  } finally {
+    await c.stop();
+  }
+});
+
+test('health/ready: close() の先頭で shuttingDown が true になる', async () => {
+  const c = await start();
+  try {
+    assert.equal(c.app.shuttingDown, false);
+  } finally {
+    await c.stop();
+  }
+  assert.equal(c.app.shuttingDown, true);
+});
+
+test('X-Request-Id: 生成・引き継ぎ・不正な値は無視・Cf-Ray の採用。エラー・静的ファイルにも付く', async () => {
+  const c = await start();
+  try {
+    const host = `127.0.0.1:${c.port}`;
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+    const a = await raw(c, 'GET', '/healthz', { Host: host });
+    const b = await raw(c, 'GET', '/healthz', { Host: host });
+    assert.match(a.headers['x-request-id'] as string, uuid);
+    assert.notEqual(a.headers['x-request-id'], b.headers['x-request-id']);
+    assert.equal((await raw(c, 'GET', '/healthz', { Host: host, 'X-Request-Id': 'abc.DEF_1-2' })).headers['x-request-id'], 'abc.DEF_1-2');
+    for (const bad of ['has space', 'a/b', 'x'.repeat(65), 'a:b', '']) {
+      const r = await raw(c, 'GET', '/healthz', { Host: host, 'X-Request-Id': bad });
+      assert.match(r.headers['x-request-id'] as string, uuid, bad);
+    }
+    assert.equal((await raw(c, 'GET', '/healthz', { Host: host, 'Cf-Ray': '8a1b2c3d4e5f6789-NRT' })).headers['x-request-id'], '8a1b2c3d4e5f6789-NRT');
+    // X-Request-Id が優先、不正なら Cf-Ray
+    assert.equal((await raw(c, 'GET', '/healthz', { Host: host, 'X-Request-Id': 'mine', 'Cf-Ray': 'ray-1' })).headers['x-request-id'], 'mine');
+    assert.equal((await raw(c, 'GET', '/healthz', { Host: host, 'X-Request-Id': 'bad id', 'Cf-Ray': 'ray-1' })).headers['x-request-id'], 'ray-1');
+    // エラー（421・404・405・400）、静的ファイル、リダイレクト、204、音声
+    for (const [method, path, h, status] of [
+      ['GET', '/healthz', 'evil.example.com', 421],
+      ['GET', '/v1/nope', host, 404],
+      ['POST', '/healthz', host, 405],
+      ['GET', '//', host, 400],
+      ['GET', '/admin/', host, 200],
+      ['GET', '/admin', host, 301],
+      ['DELETE', '/v1/admin/cache', host, 204],
+    ] as const) {
+      const r = await raw(c, method, path, { Host: h, 'X-Request-Id': 'rid-1' });
+      assert.equal(r.status, status, `${method} ${path}`);
+      assert.equal(r.headers['x-request-id'], 'rid-1', `${method} ${path}`);
+    }
+    const s = await fetch(`${c.base}/v1/synthesize`, json({ text: 'あ' }, { 'X-Request-Id': 'rid-2' }));
+    assert.equal(s.status, 200);
+    assert.equal(s.headers.get('x-request-id'), 'rid-2');
+    await s.arrayBuffer();
+  } finally {
+    await c.stop();
+  }
+});
+
+test('アクセスログ: 1 要求 1 行。トークン・クエリ文字列・ヘッダは出さない。health は debug', async () => {
+  const secret = 's3cr3t-token-value-0123456789';
+  const c = await start({ TTS_TOKEN: secret });
+  const log = captureLog();
+  try {
+    const r = await fetch(`${c.base}/v1/engines?q=QUERYSECRET&token=${secret}`, { headers: { Authorization: `Bearer ${secret}`, 'X-Request-Id': 'rid-log' } });
+    assert.equal(r.status, 200);
+    await r.arrayBuffer();
+    await waitFor(() => log.lines.length >= 1);
+    assert.equal(log.lines.length, 1);
+    const l = log.lines[0]!;
+    assert.equal(l.level, 'info');
+    assert.equal(l.msg, 'request');
+    assert.equal(l.requestId, 'rid-log');
+    assert.equal(l.method, 'GET');
+    assert.equal(l.path, '/v1/engines');
+    assert.equal(l.status, 200);
+    assert.equal(typeof l.durationMs, 'number');
+    assert.equal(l.remote, '127.0.0.1');
+    assert.equal(l.bytes, Number(r.headers.get('content-length')));
+    assert.equal(l.aborted, undefined);
+
+    // 401 も 1 行、トークンもクエリも出ない
+    await (await fetch(`${c.base}/v1/engines?token=${secret}`, { headers: { Authorization: 'Bearer wrong-token-QUERYSECRET' } })).arrayBuffer();
+    await waitFor(() => log.lines.length >= 2);
+    assert.equal(log.lines.length, 2);
+    assert.equal(log.lines[1]!.status, 401);
+    const all = log.raw.join('\n');
+    assert.doesNotMatch(all, new RegExp(secret));
+    assert.doesNotMatch(all, /QUERYSECRET/);
+    assert.doesNotMatch(all, /token=/);
+    assert.doesNotMatch(all, /authorization/i);
+
+    // health は info では出ない
+    for (const path of ['/healthz', '/health', '/health/live', '/health/ready']) await (await fetch(`${c.base}${path}`)).arrayBuffer();
+    await waitFor(() => false);
+    assert.equal(log.lines.length, 2);
+  } finally {
+    log.stop();
+    await c.stop();
+  }
+});
+
+test('アクセスログ: health は debug で出る。解釈できないパスは -', async () => {
+  const c = await start();
+  const log = captureLog('debug');
+  try {
+    await (await fetch(`${c.base}/health/ready`)).arrayBuffer();
+    await raw(c, 'GET', '//', { Host: `127.0.0.1:${c.port}` });
+    await waitFor(() => log.lines.length >= 2);
+    const req = log.lines.filter(l => l.msg === 'request');
+    assert.equal(req.length, 2);
+    assert.equal(req[0]!.level, 'debug');
+    assert.equal(req[0]!.path, '/health/ready');
+    assert.equal(req[1]!.level, 'info');
+    assert.equal(req[1]!.path, '-');
+    assert.equal(req[1]!.status, 400);
+  } finally {
+    log.stop();
+    await c.stop();
+  }
+});
+
+test('アクセスログ: 応答前に切断したら status 0・aborted。500 は error で requestId と stack', async () => {
+  const c = await start();
+  const log = captureLog();
+  try {
+    c.engine.delayMs = 2000;
+    const ac = new AbortController();
+    const p = fetch(`${c.base}/v1/synthesize`, { ...json({ text: 'あ' }, { 'X-Request-Id': 'rid-abort' }), signal: ac.signal }).catch(() => null);
+    while (c.engine.calls.length === 0) await new Promise(r => setTimeout(r, 5));
+    ac.abort();
+    await p;
+    await waitFor(() => log.lines.some(l => l.msg === 'request' && l.requestId === 'rid-abort'));
+    const line = log.lines.find(l => l.msg === 'request' && l.requestId === 'rid-abort')!;
+    assert.equal(line.status, 0);
+    assert.equal(line.aborted, true);
+    await waitFor(() => log.lines.some(l => l.msg === 'client disconnected before the response'));
+    const disc = log.lines.find(l => l.msg === 'client disconnected before the response')!;
+    assert.equal(disc.level, 'info');
+    assert.equal(disc.requestId, 'rid-abort');
+    assert.equal(disc.path, '/v1/synthesize');
+
+    c.engine.delayMs = 0;
+    c.app.synth.normalize = () => {
+      throw new Error('kaboom');
+    };
+    const r = await fetch(`${c.base}/v1/normalize?x=QUERYSECRET`, json({ text: 'a' }, { 'X-Request-Id': 'rid-500' }));
+    assert.equal(r.status, 500);
+    await r.arrayBuffer();
+    await waitFor(() => log.lines.some(l => l.msg === 'request' && l.requestId === 'rid-500'));
+    const err = log.lines.find(l => l.level === 'error' && l.requestId === 'rid-500')!;
+    assert.equal(err.msg, 'internal error');
+    assert.equal(err.method, 'POST');
+    assert.equal(err.path, '/v1/normalize');
+    assert.equal((err.err as { message: string }).message, 'kaboom');
+    assert.match((err.err as { stack: string }).stack, /kaboom/);
+    assert.doesNotMatch(log.raw.join('\n'), /QUERYSECRET/);
+  } finally {
+    log.stop();
+    await c.stop();
+  }
+});
+
+test('Host: TTS_HOSTS=0.0.0.0 は 127.0.0.1:port・localhost:port・TTS_ALLOWED_HOSTS を許し、0.0.0.0:port は 421', async () => {
+  const c = await start({ TTS_HOSTS: '0.0.0.0', TTS_ALLOW_ANY_ADDRESS: '1', TTS_TOKEN: 't'.repeat(32), TTS_ALLOWED_HOSTS: 'tts.example.com' });
+  try {
+    for (const host of [`127.0.0.1:${c.port}`, `localhost:${c.port}`, 'tts.example.com', `tts.example.com:${c.port}`]) {
+      assert.equal((await raw(c, 'GET', '/health', { Host: host })).status, 200, host);
+    }
+    for (const host of [`0.0.0.0:${c.port}`, '0.0.0.0', `[::1]:${c.port}`, `[::]:${c.port}`, 'evil.example.com']) {
+      assert.equal((await raw(c, 'GET', '/health', { Host: host })).status, 421, host);
+    }
+    // 未指定アドレスはループバック以外なのでトークンが要る
+    assert.equal((await raw(c, 'GET', '/v1/engines', { Host: `127.0.0.1:${c.port}` })).status, 401);
+  } finally {
+    await c.stop();
+  }
+  const v6 = await start({ TTS_HOSTS: '::', TTS_ALLOW_ANY_ADDRESS: '1', TTS_TOKEN: 't'.repeat(32) });
+  try {
+    for (const host of [`[::1]:${v6.port}`, `localhost:${v6.port}`]) {
+      assert.equal((await raw(v6, 'GET', '/health', { Host: host })).status, 200, host);
+    }
+    for (const host of [`[::]:${v6.port}`, `127.0.0.1:${v6.port}`, `0.0.0.0:${v6.port}`]) {
+      assert.equal((await raw(v6, 'GET', '/health', { Host: host })).status, 421, host);
+    }
+  } finally {
+    await v6.stop();
   }
 });

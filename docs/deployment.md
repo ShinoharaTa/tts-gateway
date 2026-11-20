@@ -1,5 +1,7 @@
 # 運用
 
+コンテナ（Docker / Coolify）で動かす手順は [DEPLOYMENT.md](../DEPLOYMENT.md) にあります。ここは systemd で直接動かす場合です。
+
 ## 速度とメモリの目安
 
 Intel N100、WASM カーネル、合成 1 本での実測。

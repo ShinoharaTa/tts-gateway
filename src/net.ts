@@ -7,6 +7,7 @@
  * - 許可リスト外の接続元は connection の時点でソケットを閉じる（HTTP 層の 403 は server.ts に残す）
  */
 import { createServer, type RequestListener, type Server } from 'node:http';
+import { log as logger } from './log.ts';
 
 export type Cidr = { family: 4 | 6; bytes: Uint8Array; prefix: number };
 
@@ -141,7 +142,8 @@ export type ListenOptions = {
   /** 指定すると、外の接続元は connection の時点で閉じる */
   allowCidrs?: readonly Cidr[];
   maxConnections?: number;
-  log?: (msg: string) => void;
+  /** level を省略したものは info */
+  log?: (msg: string, level?: 'info' | 'warn' | 'error') => void;
   /** 再試行中に EADDRNOTAVAIL 以外のエラーが起きたとき（起動はもう終わっているので reject できない） */
   onFatal?: (e: Error) => void;
   /** テスト用: 再試行の間隔 */
@@ -158,7 +160,7 @@ const KEEP_ALIVE_TIMEOUT_MS = 5_000;
  * ほかのエラー（EADDRINUSE など）は reject（作った server は閉じる）。再試行中に起きたら log して onFatal
  */
 export const listenAll = async (handler: RequestListener, hosts: readonly string[], port: number, opts: ListenOptions = {}): Promise<Listening> => {
-  const log = opts.log ?? console.error;
+  const log = opts.log ?? ((msg: string, level: 'info' | 'warn' | 'error' = 'info') => logger[level](msg));
   const retryMs = opts.retryMs ?? RETRY_LISTEN_MS;
   const servers: Server[] = [];
   const timers = new Set<NodeJS.Timeout>();
@@ -200,7 +202,7 @@ export const listenAll = async (handler: RequestListener, hosts: readonly string
               const onError = (e: NodeJS.ErrnoException): void => {
                 server.off('listening', onListening);
                 if (e.code === 'EADDRNOTAVAIL') {
-                  if (first) log(`listen ${host}:${port}: address not available yet, retrying every ${retryMs / 1000}s`);
+                  if (first) log(`listen ${host}:${port}: address not available yet, retrying every ${retryMs / 1000}s`, 'warn');
                   first = false;
                   const t = setTimeout(() => {
                     timers.delete(t);
@@ -211,7 +213,7 @@ export const listenAll = async (handler: RequestListener, hosts: readonly string
                 } else if (first) reject(e);
                 else {
                   // 起動時の Promise はもう resolve 済み。握りつぶさずに知らせる
-                  log(`listen ${host}:${port}: ${e.message}`);
+                  log(`listen ${host}:${port}: ${e.message}`, 'error');
                   opts.onFatal?.(e);
                 }
               };
