@@ -4,13 +4,14 @@
 
 - ベース URL: `http://<host>:<port>`（既定ポート 8710）
 - 文字コード: UTF-8。リクエスト本文は `Content-Type: application/json` のみ受け付ける（それ以外は 415）。JSON を受ける `POST` / `PUT` は本文が空でも `Content-Type` が違えば 415。本文の上限は 1MB（超えたら 400）。
-- 認証: 環境変数 `TTS_TOKEN` を設定したときだけ、`/healthz` と設定画面の静的ファイル（`/admin/`。画面で入力したトークンを API の呼び出しに付ける）以外で `Authorization: Bearer <TTS_TOKEN>` が必須。`TTS_ADMIN_TOKEN` でも通る。
+- 認証: 環境変数 `TTS_TOKEN` を設定したときだけ、`/healthz`・`/health`・`/health/live`・`/health/ready` と設定画面の静的ファイル（`/admin/`。画面で入力したトークンを API の呼び出しに付ける）以外で `Authorization: Bearer <TTS_TOKEN>` が必須。`TTS_ADMIN_TOKEN` でも通る。
   `/v1/admin/*` は `TTS_ADMIN_TOKEN` を設定したときだけ、その値が必須（未設定なら `TTS_TOKEN` の規則に従う）。
   認証はパスの有無より先に行う（トークンが要る構成では、未定義のパス・未対応のメソッドも未認証なら 401）。
 - 接続元: `TTS_ALLOW_CIDRS` に入らない接続元は 403（`forbidden`）。
 - Host: `Host` ヘッダが `TTS_HOSTS` の各アドレス:`TTS_PORT`（IPv6 は `[::1]:8710` の形。ポート 80 ならポート無しも可）、`127.0.0.1`・`::1` で待ち受けるときの `localhost:<port>`、`TTS_ALLOWED_HOSTS` のホスト名（ポートは問わない）以外なら全パスで 421（`misdirected_request`）。DNS rebinding 対策。
 - Origin: `GET` / `HEAD` / `OPTIONS` 以外で `Origin` ヘッダがあり、その host（ポート含む）が上の Host の許可に入らなければ 403（`forbidden_origin`）。`Origin: null` も 403。`Origin` が無い要求（curl など）は通す。
 - CORS ヘッダは返さない（別オリジンのブラウザからは呼べない。JSON 必須と合わせて CSRF 対策）。
+- リクエスト ID: すべての応答（エラー・静的ファイル・音声を含む）に `X-Request-Id` ヘッダを付ける。要求の `X-Request-Id` が `^[A-Za-z0-9._-]{1,64}$` に合えばその値、無ければ `Cf-Ray` が同じ形に合えばその値、どちらも無ければ生成した UUID。アクセスログ・エラーログの `requestId` と同じ値。
 
 ## エラー形式
 
@@ -44,11 +45,29 @@
 
 ## GET /healthz（HEAD も可）
 
-モデルを読まずに返す。認証不要。`HEAD` は 200 で本文なし。
+モデルを読まずに返す。認証不要。`HEAD` は 200 で本文なし。`GET` / `HEAD` 以外は 405（`Allow: GET, HEAD`）。
 
 ```json
 { "status": "ok", "version": "0.1.0" }
 ```
+
+`GET /health`・`GET /health/live`（HEAD も可）も同じ応答。
+
+### GET /health/ready（HEAD も可）
+
+準備ができていれば 200 で `/healthz` と同じ本文。認証・メソッドの規則も `/healthz` と同じ。
+次のときは 503（`Retry-After` は付けない。エラー形式ではなくこの形）:
+
+| `reason` | 条件 |
+|---|---|
+| `shutting down` | 終了処理中（SIGTERM などを受けた後） |
+| `data directory is not writable` | データディレクトリ（`TTS_DATA_DIR`）が無い・読み書きできない |
+
+```json
+{ "status": "unavailable", "reason": "shutting down" }
+```
+
+合成エンジン・ffmpeg・声の有無は見ない（声が 0 件でも 200）。
 
 ## GET /v1/engines
 

@@ -7,40 +7,67 @@
  *
  * models fetch はサーバーと同じ models.json を書くので、サーバーを止めてから使う（動いているときは設定画面から追加する）。
  */
-import { loadConfig } from './config.ts';
+import { mkdir } from 'node:fs/promises';
+import { loadConfig, VERSION } from './config.ts';
+import { configureLog, log } from './log.ts';
 import { listenAll } from './net.ts';
-import { createApp, createHandler } from './server.ts';
+import { createApp, createHandler, type App } from './server.ts';
 
 const USAGE = `usage:
   node src/cli.ts serve
   node src/cli.ts models fetch [id...]
   node src/cli.ts models list`;
 
+/** 終了処理がこれより長くかかったら強制終了する */
+const STOP_TIMEOUT_MS = 10_000;
+
 const serve = async (): Promise<void> => {
+  configureLog(process.env);
   const config = loadConfig();
-  const app = await createApp(config);
   let stopping = false;
+  let app: App | undefined;
   let listening: Awaited<ReturnType<typeof listenAll>> | undefined;
+  // 起動途中に届いたシグナルでも止まる（app・listening がまだ無ければその分は飛ばす）
   const stop = async (reason: string, code = 0): Promise<void> => {
     if (stopping) return;
     stopping = true;
-    console.error(`${reason}: stopping`);
+    log.info('stopping', { reason });
+    setTimeout(() => {
+      log.error('shutdown timed out', { timeoutMs: STOP_TIMEOUT_MS });
+      process.exit(1);
+    }, STOP_TIMEOUT_MS).unref();
+    if (app) app.shuttingDown = true;
     await listening?.close();
-    await app.close();
+    await app?.close();
     process.exit(code);
   };
+  // コンテナでは PID 1 になり、ハンドラを登録する前の SIGTERM は無視されるので、設定を読んだらすぐ登録する
+  process.on('SIGINT', () => void stop('SIGINT'));
+  process.on('SIGTERM', () => void stop('SIGTERM'));
+  process.on('uncaughtException', e => {
+    log.error('uncaught exception', { err: e });
+    process.exit(1);
+  });
+  process.on('unhandledRejection', e => {
+    log.error('unhandled rejection', { err: e });
+    process.exit(1);
+  });
+  log.info('starting', {
+    version: VERSION, node: process.version, dataDir: config.dataDir, cacheDir: config.cacheDir,
+    hosts: config.hosts, port: config.port, concurrency: config.concurrency,
+  });
+  // データディレクトリは最初の書き込みまで作られないので、ここで作る（/health/ready が書けるかを見るため）。作れなければ ready が 503 になる
+  await mkdir(config.dataDir, { recursive: true }).catch(e => log.warn(`cannot create the data directory ${config.dataDir}: ${(e as Error).message}`));
+  app = await createApp(config);
   listening = await listenAll(createHandler(app), config.hosts, config.port, {
     allowCidrs: config.allowCidrs,
     maxConnections: config.maxConnections,
     // 再試行中の EADDRINUSE などは起動失敗として終了する（systemd の Restart=on-failure に任せる）
     onFatal: () => void stop('listen failed', 1),
   });
-  console.error(`tts-gateway: data ${config.dataDir}, cache ${config.cacheDir}`);
   const ffmpeg = await app.ffmpeg.get();
   if (!ffmpeg.available)
-    console.error(`ffmpeg is not available (${ffmpeg.path}: ${ffmpeg.reason}): only wav at the engine's sample rate can be returned`);
-  process.on('SIGINT', () => void stop('SIGINT'));
-  process.on('SIGTERM', () => void stop('SIGTERM'));
+    log.warn(`ffmpeg is not available (${ffmpeg.path}: ${ffmpeg.reason}): only wav at the engine's sample rate can be returned`);
 };
 
 const mb = (n: number): string => `${(n / 1024 / 1024).toFixed(1)}MB`;
@@ -112,6 +139,7 @@ try {
     process.exit(2);
   }
 } catch (e) {
-  console.error((e as Error).message);
+  if (cmd === 'serve') log.error((e as Error).message);
+  else console.error((e as Error).message);
   process.exit(1);
 }
