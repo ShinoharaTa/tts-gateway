@@ -74,7 +74,7 @@ Full reference: [docs/api.md](docs/api.md) and [openapi.yaml](openapi.yaml) (Ope
 
 ## Admin page
 
-Open `http://<host>:8710/admin/` to check the server status, add or remove voices, edit the reading dictionary, change settings, and try voices.
+Open `http://<host>:8710/admin/` to check the server status, add or remove voices, edit the reading dictionary, change settings, issue API tokens, and try voices.
 
 ## Using it over the network
 

@@ -24,14 +24,18 @@ export const DEFAULT_SETTINGS: Settings = {
   cacheTtlDays: 30,
 };
 
-/** path.tmp に書いて fsync してから rename し、親ディレクトリも fsync する（親の fsync の失敗は無視） */
-export const writeAtomic = async (path: string, body: string): Promise<void> => {
+/**
+ * path.tmp に書いて fsync してから rename し、親ディレクトリも fsync する（親の fsync の失敗は無視）。
+ * mode を渡すとその権限で作る（古い tmp が残っていた場合・umask に備えて chmod もする）
+ */
+export const writeAtomic = async (path: string, body: string, mode?: number): Promise<void> => {
   const dir = dirname(path);
   await mkdir(dir, { recursive: true });
   const tmp = `${path}.${process.pid}.tmp`;
   try {
-    const fh = await open(tmp, 'w');
+    const fh = mode === undefined ? await open(tmp, 'w') : await open(tmp, 'w', mode);
     try {
+      if (mode !== undefined) await fh.chmod(mode);
       await fh.writeFile(body);
       await fh.sync();
     } finally {

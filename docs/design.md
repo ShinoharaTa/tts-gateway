@@ -32,6 +32,7 @@ src/
   queue.ts            # 同時実行数・待ち行列上限・同一キーの合流
   cache.ts            # ディスクキャッシュ（キー→ファイル + メタ JSON、LRU・TTL）
   settings.ts         # データディレクトリの settings.json（原子的書き込み）
+  tokens.ts           # 発行した API トークン（api-tokens.json。ハッシュだけ保存、最終使用時刻は 60 秒ごとに書く）
   models/registry.ts  # models.json（登録モデルと状態）
   models/download.ts  # https 取得、ホスト許可、上限、sha256、.part → rename、進捗
   models/catalog.ts   # catalog/*.json を読む
@@ -50,7 +51,7 @@ test/*.test.ts
 
 | 環境変数 | 既定 | 中身 |
 |---|---|---|
-| `TTS_DATA_DIR` | `$XDG_DATA_HOME/tts-gateway`（`~/.local/share/tts-gateway`） | `settings.json`、`models.json`、`models/<engine>/<id>.<ext>`、`readings.tsv`（ユーザー辞書） |
+| `TTS_DATA_DIR` | `$XDG_DATA_HOME/tts-gateway`（`~/.local/share/tts-gateway`） | `settings.json`、`models.json`、`models/<engine>/<id>.<ext>`、`readings.tsv`（ユーザー辞書）、`api-tokens.json`（発行した API トークン、0600） |
 | `TTS_CACHE_DIR` | `$XDG_CACHE_HOME/tts-gateway/audio` | 音声キャッシュ |
 
 ## Engine インターフェース
@@ -106,6 +107,8 @@ interface Engine {
 - 要求ごとに ID を決め（`X-Request-Id` → `Cf-Ray` → UUID）、応答の `X-Request-Id` に付ける。応答が閉じたらアクセスログを 1 行
   （`requestId`・`method`・`path`（クエリを除く）・`status`（応答前に切れたら 0 と `aborted`）・`durationMs`・`remote`・`bytes`）。
   ヘッダ・本文・クエリはログに出さない（トークンを残さない）。ヘルスチェックのパスは `debug`。5xx・未知の例外は `error` で同じ `requestId` を付ける。
+  発行した API トークンで認証を通った要求だけ、アクセスログに `tokenId`（公開してよい id）を付ける。
+- API トークンの発行は `api token issued`（`tokenId`・`label`・`expiresAt`）、失効・削除は `api token revoked`（`tokenId`・`label`）、掃除は `api tokens purged`（`count`）を info で出す。トークンの値・ハッシュはどのログにも出さない。
 - `/healthz`・`/health`・`/health/live` は常に 200。`/health/ready` は終了処理中（`App.shuttingDown`）かデータディレクトリに読み書きできなければ 503。
 - `serve` は設定を読んだ直後（`createApp` より前）に SIGINT / SIGTERM を登録する（コンテナの PID 1 では登録前の SIGTERM が無視される）。
   止めるときは `shuttingDown` を立て、待ち受けを閉じ、`app.close()`、終了コード 0。10 秒で終わらなければ終了コード 1。
@@ -113,12 +116,23 @@ interface Engine {
 
 ## 設定画面（/admin/）
 
-- 1 ページ。上から「状態」「試聴」「モデル」「読み辞書」「設定」「クレジット」。
+- 1 ページ。上から「状態」「試聴」「モデル」「読み辞書」「設定」「API トークン」「クレジット」。
 - モデル: 一覧（状態・サイズ・進捗バー）、カタログから追加（選ぶだけ）、URL で追加（id・名前・URL・sha256 任意）、取り直し、削除。
   ダウンロード中は 1 秒ごとに `GET /v1/admin/models` を見る。
 - 試聴: テキスト・声・速さ・高さ・感情・形式 → `/v1/synthesize` → `<audio>` で再生、ダウンロードリンク。`/v1/normalize` の結果（読み・未知語）も出す。未知語は 1 タップで辞書の追加欄に入る。
 - `TTS_ADMIN_TOKEN` / `TTS_TOKEN` があるときは画面でトークンを入力し、`localStorage` に保存して `Authorization` に付ける。
+- API トークン: ラベルと期限（1 時間 / 24 時間 / 7 日 / 30 日）を選んで発行し、値を 1 回だけ表示する（DOM にだけ置き、localStorage などに入れない）。一覧から失効・削除。
+  発行したトークンは管理 API に使えないので、このブラウザのトークンとして使うボタンは付けない。
 - 外部 CDN を使わない（全部 public/ に置く）。
+
+## API トークン（tokens.ts）
+
+- 形式は `ttsg_<id 8 桁>_<secret 48 桁>`（hex。secret は 192 bit）。保存するのは `sha256(値全体)`・id・ラベル・時刻だけ。照合は id で引いて `timingSafeEqual`。
+- 認証の順は環境変数のトークン → 発行トークン。発行トークンが通るのは通常の API だけ（`/v1/admin/*` と、`/v1/admin/` で始まる未定義のパスは 401）。`TTS_TOKEN` が無い構成では発行しない（409）。
+- 最終使用時刻はメモリで更新し、60 秒ごとのタイマー（`unref`）と `app.close()` でまとめて書く。書けなければ次回に再試行し、warn は失敗が続く間 1 回だけ。
+- 期限切れは期限から 7 日後に消す（読み込み時はメモリだけ、発行時と 60 秒ごとのタイマーではファイルにも）。
+- `api-tokens.json` が読めない・形が違うときは起動を止めず空で始め（発行済みは全部 401）、元のファイルを `api-tokens.json.broken` に退避して error を 1 行出す。
+- 失効はメモリから先に消す（即時に 401）。ファイルに書けなければ 500 を返すが、メモリでは消えたまま 60 秒ごとに書き直す。書けないまま再起動するとそのトークンは戻る。
 
 ## systemd（--user）
 
