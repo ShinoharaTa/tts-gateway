@@ -16,6 +16,7 @@ import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { ApiError, invalid } from '../../errors.ts';
+import { log } from '../../log.ts';
 import type { ModelRecord, Registry } from '../../models/registry.ts';
 import type { Settings } from '../../settings.ts';
 import { checkBool, checkEnum, checkInt, checkKeys, checkNumber, checkObject, checkString } from '../../validate.ts';
@@ -329,7 +330,7 @@ export class ZenTtsEngine implements Engine {
     } catch (e) {
       throw unavailable(`failed to start synthesis process: ${(e as Error).message}`);
     }
-    proc.on('error', e => console.error(`synthesis process error: ${e.message}`));
+    proc.on('error', e => log.error(`synthesis process error: ${e.message}`));
     return proc;
   }
 

@@ -93,6 +93,7 @@ The documents under `docs/` are written in Japanese.
 - [docs/api.md](docs/api.md): API reference
 - [docs/configuration.md](docs/configuration.md): environment variables, voices, and the reading dictionary
 - [docs/deployment.md](docs/deployment.md): systemd setup, security, and performance figures
+- [DEPLOYMENT.md](DEPLOYMENT.md): running in a container (Docker / Coolify)
 - [docs/design.md](docs/design.md): internal design
 
 ## Roadmap

@@ -4,12 +4,13 @@
 
 | 変数 | 既定 | 説明 |
 |---|---|---|
-| `TTS_HOSTS` | `127.0.0.1` | 待ち受けるアドレス（カンマ区切り、各アドレスに listen）。IP アドレスだけ（`localhost` などのホスト名は起動時エラー）。`0.0.0.0`・`::` などの未指定アドレスは起動時エラー。まだ無いアドレス（起動直後の Tailscale など）は 5 秒ごとに再試行。ループバック以外を入れるとトークンが必須 |
+| `TTS_HOSTS` | `127.0.0.1` | 待ち受けるアドレス（カンマ区切り、各アドレスに listen）。IP アドレスだけ（`localhost` などのホスト名は起動時エラー）。`0.0.0.0`・`::` などの未指定アドレスは、`TTS_ALLOW_ANY_ADDRESS=1` が無ければ起動時エラー（このとき `Host` は `0.0.0.0:ポート` ではなく、`127.0.0.1:ポート`（`::` なら `[::1]:ポート`）と `localhost:ポート` を許す）。まだ無いアドレス（起動直後の Tailscale など）は 5 秒ごとに再試行。ループバック以外を入れるとトークンが必須 |
 | `TTS_PORT` | `8710` | ポート |
+| `TTS_ALLOW_ANY_ADDRESS` | （無し） | `1` のときだけ `TTS_HOSTS` に未指定アドレス（`0.0.0.0`・`::`）を許す（コンテナ用。自分の IP が事前に分からないため）。それ以外の値や未設定では起動時エラー。ループバック以外なのでトークンは必須（`TTS_ALLOW_NO_TOKEN=1` で外せる） |
 | `TTS_ALLOWED_HOSTS` | （無し） | `Host` ヘッダに許すホスト名（カンマ区切り、例 `tts.example.com,myhost.tailnet.example`）。ポートは問わず、大文字小文字は区別しない。`TTS_HOSTS` の各アドレス:ポートと `localhost:ポート`（ループバックで待ち受けるとき）はこれとは別に許す。どれにも入らない `Host` は 421 |
 | `TTS_ALLOW_CIDRS` | `127.0.0.1/32,::1/128` | 接続を許す範囲。外は接続の時点で切断（HTTP 層でも 403）。IPv4-mapped IPv6（`::ffff:a.b.c.d`）は IPv4 として判定。`0.0.0.0/0`・`::/0` は起動時に警告 |
 | `TTS_MAX_CONNECTIONS` | `64` | 待ち受けアドレスごとの同時接続の上限（1〜1024） |
-| `TTS_TOKEN` | （無し） | 設定すると `/healthz` と設定画面の静的ファイル以外で `Authorization: Bearer <値>` が必須（`TTS_ADMIN_TOKEN` の値でも通る）。`change-me` で始まる値は起動時エラー、16 文字未満は警告 |
+| `TTS_TOKEN` | （無し） | 設定すると `/healthz`・`/health*` と設定画面の静的ファイル以外で `Authorization: Bearer <値>` が必須（`TTS_ADMIN_TOKEN` の値でも通る）。`change-me` で始まる値は起動時エラー、16 文字未満は警告 |
 | `TTS_ADMIN_TOKEN` | （無し） | 設定すると `/v1/admin/*` はこの値が必須（無ければ `TTS_TOKEN` の規則）。値の規則は `TTS_TOKEN` と同じ |
 | `TTS_ALLOW_NO_TOKEN` | （無し） | `1` にすると、`TTS_HOSTS` にループバック以外があってトークンが無くても起動する（起動時に警告）。それ以外の値や未設定では起動時エラー |
 | `TTS_DATA_DIR` | `$XDG_DATA_HOME/tts-gateway`（`~/.local/share/tts-gateway`） | `settings.json`・`models.json`・`models/<engine>/<id>.ztm`・ユーザー辞書 `readings.tsv` |
@@ -23,6 +24,10 @@
 | `TTS_MODEL_MAX_MB` | `512` | モデルの大きさの上限（MB） |
 | `TTS_MODEL_TIMEOUT_SEC` | `600` | モデル 1 件のダウンロードの上限（秒、10〜86400）。超えたら失敗。別に無通信 30 秒でも失敗 |
 | `FFMPEG` | `ffmpeg` | ffmpeg のパス |
+| `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error`。これ未満は出さない（ヘルスチェックのアクセスログは `debug`）。ほかの値は起動時エラー |
+| `LOG_FORMAT` | `text` | `text`（`<msg> key=value ...`。時刻・レベルは付けない）/ `json`（1 行 1 JSON。`time`・`level`・`service`・`env`・`msg` とフィールド）。ほかの値は起動時エラー。debug・info は stdout、warn・error は stderr |
+| `SERVICE_NAME` | `tts-gateway` | json ログの `service` |
+| `APP_ENV` | （無し） | json ログの `env`（空なら出さない） |
 
 例は [`.env.example`](../.env.example)。
 

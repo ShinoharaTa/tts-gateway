@@ -4,6 +4,7 @@
  */
 import { createHash } from 'node:crypto';
 import { ApiError, invalid, notFound } from './errors.ts';
+import { log } from './log.ts';
 import type { AudioCache } from './cache.ts';
 import { CONTENT_TYPES, DEFAULT_BITRATES, encode, ffmpegUnavailable, needsFfmpeg, outputSampleRate, type FfmpegProbe } from './audio/encode.ts';
 import { applyGain, concat, samplesToMs, silence, trimSilence } from './audio/pcm.ts';
@@ -336,7 +337,7 @@ export class Synthesizer {
         if (useCache) {
           await this.d.cache
             .put(key, r.audio, { contentType, durationMs: r.durationMs, sampleRate: r.sampleRate })
-            .catch(e => console.error(`cache put failed: ${(e as Error).message}`));
+            .catch(e => log.error(`cache put failed: ${(e as Error).message}`));
         }
         return { ...r, synthesisMs };
       } finally {

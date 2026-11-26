@@ -3,12 +3,14 @@
  *
  * - 許可リスト外の接続元は全パスで 403。Host が TTS_HOSTS:TTS_PORT・localhost:TTS_PORT・TTS_ALLOWED_HOSTS 以外なら 421、
  *   GET / HEAD / OPTIONS 以外で Origin の host が同じ許可に入らなければ 403（DNS rebinding・CSRF 対策）
- * - 認証は TTS_TOKEN があれば /healthz と設定画面の静的ファイル以外で必須（TTS_ADMIN_TOKEN でも通る）、
+ * - 認証は TTS_TOKEN があれば /healthz・/health*・設定画面の静的ファイル以外で必須（TTS_ADMIN_TOKEN でも通る）、
  *   /v1/admin/* は TTS_ADMIN_TOKEN があればその値（無ければ TTS_TOKEN の規則）
  * - 本文は application/json だけ（ほかは 415）。CORS ヘッダは返さない
+ * - 全応答に X-Request-Id を付け、応答が終わったらアクセスログを 1 行出す（ヘッダ・本文・クエリは出さない）
  */
-import { createHash, timingSafeEqual } from 'node:crypto';
-import { readFile, rm } from 'node:fs/promises';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { constants as fsConstants } from 'node:fs';
+import { access, readFile, rm } from 'node:fs/promises';
 import type { IncomingMessage, RequestListener, ServerResponse } from 'node:http';
 import { join } from 'node:path';
 import { FfmpegProbe } from './audio/encode.ts';
@@ -17,10 +19,11 @@ import { VERSION, type Config } from './config.ts';
 import { createEngines, MODEL_EXTS, type EngineDeps } from './engines/index.ts';
 import type { Engine } from './engines/types.ts';
 import { ApiError, conflict, invalid, notFound } from './errors.ts';
+import { log } from './log.ts';
 import { loadCatalog, type CatalogModel } from './models/catalog.ts';
 import { ModelDownloader } from './models/download.ts';
 import { MAX_MODELS, MODEL_ID_RE, Registry, type ModelRecord } from './models/registry.ts';
-import { isAllowed, parseIp } from './net.ts';
+import { isAllowed, isUnspecified, parseIp } from './net.ts';
 import { SynthQueue } from './queue.ts';
 import { SettingsStore, validateSettingsPatch } from './settings.ts';
 import { Synthesizer } from './synthesize.ts';
@@ -41,6 +44,8 @@ export type App = {
   /** ffmpeg の有無（30 秒たてば確かめ直す） */
   ffmpeg: FfmpegProbe;
   startedAt: number;
+  /** 終了処理中（/health/ready が 503 を返す）。close() の先頭で true にする */
+  shuttingDown: boolean;
   close: () => Promise<void>;
 };
 
@@ -84,18 +89,23 @@ export const createApp = async (config: Config, o: AppOverrides = {}): Promise<A
     maxChars: config.maxChars, timeoutSec: config.timeoutSec, ffmpeg: config.ffmpeg, ffmpegProbe: ffmpeg,
   });
   settings.onChange(() => {
-    void cache.evict().catch(e => console.error(`cache evict failed: ${(e as Error).message}`));
+    void cache.evict().catch(e => log.error(`cache evict failed: ${(e as Error).message}`));
     for (const e of engines.values()) (e as Engine & { settingsChanged?: () => void }).settingsChanged?.();
   });
   // 作ってから TTL を過ぎたものを 1 時間ごとに消す
   const sweep = setInterval(() => void cache.evict().catch(() => {}), 3_600_000);
   sweep.unref();
-  const close = async (): Promise<void> => {
-    clearInterval(sweep);
-    await downloader.cancelAll();
-    await Promise.all([...engines.values()].map(e => e.close()));
+  const app: App = {
+    config, engines, registry, settings, cache, queue, dictionary, catalog, downloader, synth, ffmpeg, startedAt: Date.now(),
+    shuttingDown: false,
+    close: async () => {
+      app.shuttingDown = true;
+      clearInterval(sweep);
+      await downloader.cancelAll();
+      await Promise.all([...engines.values()].map(e => e.close()));
+    },
   };
-  return { config, engines, registry, settings, cache, queue, dictionary, catalog, downloader, synth, ffmpeg, startedAt: Date.now(), close };
+  return app;
 };
 
 // ---- 入出力 ----
@@ -192,7 +202,10 @@ const requireAuth = (req: IncomingMessage, config: Config, admin: boolean): void
 
 // ---- Host / Origin ----
 
-/** Host ヘッダ（Origin の host 部分）の判定。TTS_HOSTS の各アドレス:ポート、ループバックなら localhost:ポート、TTS_ALLOWED_HOSTS（ポートは問わない） */
+/**
+ * Host ヘッダ（Origin の host 部分）の判定。TTS_HOSTS の各アドレス:ポート、ループバックなら localhost:ポート、TTS_ALLOWED_HOSTS（ポートは問わない）。
+ * 未指定アドレス（0.0.0.0・::）はそれ自体を許さず、代わりにループバックの名前（127.0.0.1 か [::1]、と localhost）を許す
+ */
 const hostMatcher = (config: Config): ((host: string | undefined) => boolean) => {
   const exact = new Set<string>();
   const add = (name: string): void => {
@@ -200,6 +213,11 @@ const hostMatcher = (config: Config): ((host: string | undefined) => boolean) =>
     if (config.port === 80) exact.add(name);
   };
   for (const h of config.hosts) {
+    if (isUnspecified(h)) {
+      add(parseIp(h)!.family === 4 ? '127.0.0.1' : '[::1]');
+      add('localhost');
+      continue;
+    }
     const lower = h.toLowerCase();
     if (lower.includes(':')) {
       add(`[${lower}]`);
@@ -381,7 +399,13 @@ const putReading = async (app: App, rawSurface: string, raw: unknown): Promise<v
 
 // ---- ルーティング ----
 
-type Route = { method: string; re: RegExp; admin: boolean; auth: boolean; run: (app: App, req: IncomingMessage, res: ServerResponse, m: string[]) => Promise<void> };
+/** ログに付ける要求の情報 */
+type ReqFields = { requestId: string; method: string; path: string };
+
+type Route = {
+  method: string; re: RegExp; admin: boolean; auth: boolean;
+  run: (app: App, req: IncomingMessage, res: ServerResponse, m: string[], f: ReqFields) => Promise<void>;
+};
 
 const healthz: Route['run'] = async (_app, req, res) => {
   await noBody(req);
@@ -389,9 +413,32 @@ const healthz: Route['run'] = async (_app, req, res) => {
   sendJson(res, 200, { status: 'ok', version: VERSION });
 };
 
+/** 終了処理中・データディレクトリに書けないときは 503（エンジン・ffmpeg・声の有無は見ない） */
+const ready: Route['run'] = async (app, req, res) => {
+  await noBody(req);
+  let reason = '';
+  if (app.shuttingDown) reason = 'shutting down';
+  else {
+    try {
+      await access(app.config.dataDir, fsConstants.W_OK | fsConstants.R_OK);
+    } catch {
+      reason = 'data directory is not writable';
+    }
+  }
+  if (reason) sendJson(res, 503, { status: 'unavailable', reason });
+  else sendJson(res, 200, { status: 'ok', version: VERSION });
+};
+
+const HEALTH_RE = /^\/(?:healthz|health|health\/live)$/;
+const READY_RE = /^\/health\/ready$/;
+/** アクセスログを debug にするパス */
+const HEALTH_PATHS = new Set(['/healthz', '/health', '/health/live', '/health/ready']);
+
 const routes: Route[] = [
-  { method: 'GET', re: /^\/healthz$/, admin: false, auth: false, run: healthz },
-  { method: 'HEAD', re: /^\/healthz$/, admin: false, auth: false, run: healthz },
+  { method: 'GET', re: HEALTH_RE, admin: false, auth: false, run: healthz },
+  { method: 'HEAD', re: HEALTH_RE, admin: false, auth: false, run: healthz },
+  { method: 'GET', re: READY_RE, admin: false, auth: false, run: ready },
+  { method: 'HEAD', re: READY_RE, admin: false, auth: false, run: ready },
   {
     method: 'GET', re: /^\/v1\/engines$/, admin: false, auth: true,
     run: async (app, req, res) => {
@@ -401,7 +448,7 @@ const routes: Route[] = [
   },
   {
     method: 'POST', re: /^\/v1\/synthesize$/, admin: false, auth: true,
-    run: async (app, req, res) => {
+    run: async (app, req, res, _m, f) => {
       // 応答を返し終える前に接続が閉じたら合成を止める（合流中なら全員が切断したときだけ止まる）
       const ac = new AbortController();
       const onClose = (): void => {
@@ -414,7 +461,7 @@ const routes: Route[] = [
       });
       if (!r || ac.signal.aborted) {
         // 切断した要求には応答を書かない（エラー扱いにしない）
-        console.log(`${req.method} ${req.url}: client disconnected before the response`);
+        log.info('client disconnected before the response', { ...f });
         return;
       }
       res.off('close', onClose);
@@ -546,20 +593,50 @@ const methodNotAllowed = (method: string, path: string, allow: string): ApiError
   return e;
 };
 
+const REQUEST_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
+
+/** X-Request-Id（形が合えば）→ Cf-Ray → 生成 */
+const requestIdOf = (req: IncomingMessage): string => {
+  for (const name of ['x-request-id', 'cf-ray']) {
+    const v = req.headers[name];
+    if (typeof v === 'string' && REQUEST_ID_RE.test(v)) return v;
+  }
+  return randomUUID();
+};
+
 export const createHandler = (app: App): RequestListener => {
   const hostOk = hostMatcher(app.config);
   return async (req, res) => {
+    const started = performance.now();
+    const requestId = requestIdOf(req);
+    const remote = req.socket.remoteAddress;
+    // writeHead に渡したヘッダとまとめて送られる
+    res.setHeader('X-Request-Id', requestId);
+    // クエリを除いたパス（ログにも使う）。解釈できなければ 400
+    let pathname: string | null = null;
+    try {
+      pathname = new URL(req.url ?? '/', 'http://localhost').pathname;
+    } catch {}
+    const f: ReqFields = { requestId, method: req.method ?? 'GET', path: pathname ?? '-' };
+    res.once('close', () => {
+      const len = res.getHeader('content-length');
+      const fields: Record<string, unknown> = {
+        ...f,
+        status: res.headersSent ? res.statusCode : 0,
+        durationMs: Math.round(performance.now() - started),
+        remote,
+        bytes: len === undefined ? undefined : Number(len),
+      };
+      if (!res.headersSent) fields.aborted = true;
+      (HEALTH_PATHS.has(f.path) ? log.debug : log.info)('request', fields);
+    });
     try {
       if (!isAllowed(req.socket.remoteAddress, app.config.allowCidrs)) throw new ApiError(403, 'forbidden', 'client address is not allowed');
       if (!hostOk(req.headers.host)) throw new ApiError(421, 'misdirected_request', 'Host header is not one of the addresses this server answers for');
       const method = req.method ?? 'GET';
       if (req.headers.origin !== undefined && !SAFE_METHODS.has(method)) checkOrigin(req.headers.origin, hostOk);
-      let path: string;
-      try {
-        path = new URL(req.url ?? '/', 'http://localhost').pathname;
-      } catch {
-        throw new ApiError(400, 'bad_request', 'invalid request target');
-      }
+      if (pathname === null) throw new ApiError(400, 'bad_request', 'invalid request target');
+      const path = pathname;
 
       if (path === '/admin' || STATIC[path]) {
         if (method !== 'GET' && method !== 'HEAD') throw methodNotAllowed(method, path, 'GET, HEAD');
@@ -573,7 +650,7 @@ export const createHandler = (app: App): RequestListener => {
       const r = matched.find(x => x.method === method);
       if (r) {
         if (r.auth) requireAuth(req, app.config, r.admin);
-        await r.run(app, req, res, r.re.exec(path)!);
+        await r.run(app, req, res, r.re.exec(path)!, f);
         return;
       }
       if (matched.length > 0) {
@@ -590,10 +667,10 @@ export const createHandler = (app: App): RequestListener => {
         return;
       }
       if (e instanceof ApiError) {
-        if (e.status >= 500) console.error(`${req.method} ${req.url}: ${e.status} ${e.code} ${e.message}`);
+        if (e.status >= 500) log.error(e.message, { ...f, status: e.status, code: e.code });
         sendError(res, e);
       } else {
-        console.error(`${req.method} ${req.url}: ${(e as Error)?.stack ?? e}`);
+        log.error('internal error', { ...f, err: e });
         sendError(res, new ApiError(500, 'internal_error', 'internal error'));
       }
     }

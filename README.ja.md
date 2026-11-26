@@ -91,6 +91,7 @@ TLS には対応していないので、VPN かリバースプロキシの内側
 - [docs/api.md](docs/api.md): API の仕様
 - [docs/configuration.md](docs/configuration.md): 環境変数・声（モデル）・読み辞書
 - [docs/deployment.md](docs/deployment.md): systemd での常駐・セキュリティ・速度とメモリの目安
+- [DEPLOYMENT.md](DEPLOYMENT.md): コンテナで動かす（Docker / Coolify）
 - [docs/design.md](docs/design.md): 内部設計
 
 ## ロードマップ

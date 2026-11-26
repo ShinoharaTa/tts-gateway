@@ -1,0 +1,25 @@
+# イメージに入れるのは package*.json・src・catalog・dict・public・LICENSE・THIRD_PARTY_NOTICES.md だけ
+.git
+.github
+.claude
+node_modules
+test
+docs
+deploy
+openapi.yaml
+README*.md
+DEPLOYMENT.md
+Dockerfile
+.dockerignore
+
+# 秘密・環境ごとの設定
+.env
+.env.*
+
+# 重み・データ・キャッシュ
+*.ztm
+*.part
+data/
+cache/
+*.tmp
+*.log

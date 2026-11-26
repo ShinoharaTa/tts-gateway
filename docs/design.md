@@ -22,6 +22,7 @@ src/
   server.ts           # node:http。ルーティング、認証、接続元の許可リスト、静的ファイル（public/）
   net.ts              # CIDR 判定、複数ホストへの listen（EADDRNOTAVAIL は 5 秒ごとに再試行）
   errors.ts           # ApiError(status, code, message, field?)
+  log.ts              # 構造化ログ（LOG_LEVEL・LOG_FORMAT。text / json、1 件 1 行）
   validate.ts         # リクエストの検証（未知フィールドは 400）
   synthesize.ts       # 前処理の前段（NFKC・URL 削除）→ 辞書 → 前処理の後段（記号の規則）→ 文分割 → エンジン → 無音処理・連結 → エンコード
   text/spoken.ts      # 記号の読み替え
@@ -97,6 +98,18 @@ interface Engine {
   共通層がその文を中央に最も近い読点・空白・中黒（無ければ中央）で半分に割って合成し直し、無音を挟まずにつなぐ（最大 4 段）。
   それでも超えるか 1 文字まで割っても超えるなら 422 `unprocessable_text`。数字の長い並びや `zenTts.accentDict` で読みが長くなった文も同じ。
 - `ZenTtsNode.load({ model })`: `modelsPath` は渡さない（G2P はパッケージ同梱）。
+
+## ログ・ヘルスチェック・終了処理
+
+- ログは `log.ts` の `log.debug/info/warn/error(msg, fields)`（`console.*` は CLI の `models` の出力だけ）。debug・info は stdout、warn・error は stderr。
+  `LOG_FORMAT=json` は 1 行 1 JSON（Error は `{ name, message, stack }`）、`text` は今までの見た目（時刻・レベルは journald が付ける）。
+- 要求ごとに ID を決め（`X-Request-Id` → `Cf-Ray` → UUID）、応答の `X-Request-Id` に付ける。応答が閉じたらアクセスログを 1 行
+  （`requestId`・`method`・`path`（クエリを除く）・`status`（応答前に切れたら 0 と `aborted`）・`durationMs`・`remote`・`bytes`）。
+  ヘッダ・本文・クエリはログに出さない（トークンを残さない）。ヘルスチェックのパスは `debug`。5xx・未知の例外は `error` で同じ `requestId` を付ける。
+- `/healthz`・`/health`・`/health/live` は常に 200。`/health/ready` は終了処理中（`App.shuttingDown`）かデータディレクトリに読み書きできなければ 503。
+- `serve` は設定を読んだ直後（`createApp` より前）に SIGINT / SIGTERM を登録する（コンテナの PID 1 では登録前の SIGTERM が無視される）。
+  止めるときは `shuttingDown` を立て、待ち受けを閉じ、`app.close()`、終了コード 0。10 秒で終わらなければ終了コード 1。
+  `uncaughtException`・`unhandledRejection` は `error` を出して終了コード 1。
 
 ## 設定画面（/admin/）
 
