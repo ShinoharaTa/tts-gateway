@@ -39,7 +39,7 @@ journalctl --user -u tts-gateway -f
 
 - **待ち受け**: 既定は `127.0.0.1` だけ。ほかのマシンから使うときは `TTS_HOSTS` に特定のアドレス（LAN・VPN のアドレス）を足します。`0.0.0.0`・`::` は起動時エラー。
 - **接続元**: `TTS_ALLOW_CIDRS` に入らない接続元は接続の時点で切断します（HTTP 層でも 403）。外からの接続を許すなら範囲をできるだけ狭くしてください。同時接続は `TTS_MAX_CONNECTIONS`（既定 64）まで、ヘッダは 10 秒・要求全体は 30 秒以内に届かなければ切断します。
-- **トークン**: `TTS_HOSTS` にループバック以外があるときは `TTS_TOKEN` か `TTS_ADMIN_TOKEN` が無いと起動しません（トークン無しで動かすなら `TTS_ALLOW_NO_TOKEN=1`）。`TTS_ADMIN_TOKEN` は管理 API（モデルの追加・削除・辞書・設定）だけを守り、通常の API にも使えます。
+- **トークン**: `TTS_HOSTS` にループバック以外があるときは `TTS_TOKEN` か `TTS_ADMIN_TOKEN` が無いと起動しません（トークン無しで動かすなら `TTS_ALLOW_NO_TOKEN=1`）。`TTS_ADMIN_TOKEN` は管理 API（モデルの追加・削除・辞書・設定）だけを守り、通常の API にも使えます。端末や Bot には、設定画面の「API トークン」で発行した期限つきの値を渡せます（通常の API だけに使え、失効できる。発行は `TTS_TOKEN` があるときだけ）。
 - **Host / Origin**: `Host` が `TTS_HOSTS` のアドレス・`localhost`・`TTS_ALLOWED_HOSTS` 以外なら 421（DNS rebinding 対策）。`GET` / `HEAD` / `OPTIONS` 以外で `Origin` がそれ以外なら 403。名前（Tailscale の MagicDNS 名など）でアクセスするならその名前を `TTS_ALLOWED_HOSTS` に入れてください。
 - **CSRF**: CORS ヘッダを返さず、本文は JSON だけを受け付けます（別オリジンのページからの要求を防ぐため）。
 - **モデルの取得**: `https`・ポート 443 で `TTS_MODEL_HOSTS` のホストだけ（リダイレクト先も検査、最大 5 回）、上限 `TTS_MODEL_MAX_MB`・`TTS_MODEL_TIMEOUT_SEC`（無通信は 30 秒）、sha256 の検査、エンジンでの読み込み検査を通ったものだけ使います。

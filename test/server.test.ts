@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { createServer, request, type Server } from 'node:http';
-import { chmod, rm, writeFile } from 'node:fs/promises';
+import { chmod, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { connect, type AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { loadConfig } from '../src/config.ts';
 import { configureLog, setLogSink } from '../src/log.ts';
-import { createApp, createHandler, type App } from '../src/server.ts';
+import { createApp, createHandler, type App, type AppOverrides } from '../src/server.ts';
 import { FakeEngine, installedModel, tempDir } from './helpers.ts';
 
 // アクセスログなどでテストの出力を埋めない（見るテストは captureLog で受ける）
@@ -17,7 +18,7 @@ silence();
 type Ctx = { base: string; port: number; app: App; engine: FakeEngine; stop: () => Promise<void> };
 
 /** 偽のエンジンで起動する。env は loadConfig に渡す（TTS_PORT は空きポートにする。Host の検査が TTS_PORT を見るため） */
-const start = async (env: Record<string, string> = {}): Promise<Ctx> => {
+const start = async (env: Record<string, string> = {}, overrides: Partial<AppOverrides> = {}): Promise<Ctx> => {
   const { dir, cleanup } = await tempDir();
   const server = createServer();
   await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
@@ -33,6 +34,7 @@ const start = async (env: Record<string, string> = {}): Promise<Ctx> => {
     isHostAllowed: h => h === '127.0.0.1',
     protocols: ['http:'],
     isPortAllowed: () => true,
+    ...overrides,
   });
   await app.registry.add(installedModel('zen-tts', 'marine'));
   server.on('request', createHandler(app));
@@ -950,5 +952,297 @@ test('Host: TTS_HOSTS=0.0.0.0 は 127.0.0.1:port・localhost:port・TTS_ALLOWED_
     }
   } finally {
     await v6.stop();
+  }
+});
+
+// ---- 発行した API トークン ----
+
+const T0 = Date.parse('2026-01-01T00:00:00Z');
+const ADMIN = 'admin-token-for-tests';
+const USER = 'user-token-for-tests';
+
+const bearer = (token?: string): Record<string, string> => (token ? { Authorization: `Bearer ${token}` } : {});
+
+type Issued = { id: string; label: string; createdAt: string; expiresAt: string; lastUsedAt: string | null; expired: boolean; token: string };
+
+const issue = async (c: Ctx, by: string | undefined, body: unknown = { label: 'pixel', expiresInSec: 3600 }): Promise<Response> =>
+  fetch(`${c.base}/v1/admin/tokens`, json(body, bearer(by)));
+
+const issued = async (c: Ctx, by: string | undefined, body?: unknown): Promise<Issued> => {
+  const r = await issue(c, by, body);
+  assert.equal(r.status, 201);
+  return (await r.json()) as Issued;
+};
+
+/** 通常の API 4 つを token で呼んで status を返す */
+const userApis = async (c: Ctx, token: string): Promise<number[]> => {
+  const out: number[] = [];
+  for (const [method, path, body] of [
+    ['GET', '/v1/engines', undefined],
+    ['GET', '/v1/dictionary', undefined],
+    ['POST', '/v1/normalize', { text: 'GitHub' }],
+    ['POST', '/v1/synthesize', { text: 'あ' }],
+  ] as const) {
+    const r = await fetch(`${c.base}${path}`, body === undefined ? { method, headers: bearer(token) } : json(body, bearer(token)));
+    await r.arrayBuffer();
+    out.push(r.status);
+  }
+  return out;
+};
+
+test('API トークン: 管理トークンで発行し、その値で通常の API が 200、管理 API は 401（構成 D）', async () => {
+  const c = await start({ TTS_TOKEN: USER, TTS_ADMIN_TOKEN: ADMIN }, { now: () => T0 });
+  try {
+    const r = await issue(c, ADMIN);
+    assert.equal(r.status, 201);
+    assert.equal(r.headers.get('cache-control'), 'no-store');
+    const t = (await r.json()) as Issued & { hash?: string };
+    assert.deepEqual(Object.keys(t).sort(), ['createdAt', 'expired', 'expiresAt', 'id', 'label', 'lastUsedAt', 'token']);
+    assert.equal(t.hash, undefined);
+    assert.match(t.token, /^ttsg_[0-9a-f]{8}_[0-9a-f]{48}$/);
+    assert.equal(t.token.slice(5, 13), t.id);
+    assert.equal(t.label, 'pixel');
+    assert.equal(t.createdAt, '2026-01-01T00:00:00Z');
+    assert.equal(t.expiresAt, '2026-01-01T01:00:00Z');
+    assert.equal(t.lastUsedAt, null);
+    assert.equal(t.expired, false);
+    assert.deepEqual(await userApis(c, t.token), [200, 200, 200, 200]);
+
+    // 管理 API は読み取りも含めて 401
+    for (const [method, path] of [
+      ['GET', '/v1/admin/status'],
+      ['GET', '/v1/admin/tokens'],
+      ['POST', '/v1/admin/tokens'],
+      ['DELETE', `/v1/admin/tokens/${t.id}`],
+      ['GET', '/v1/admin/nope'],
+    ] as const) {
+      const res = await fetch(`${c.base}${path}`, method === 'POST' ? json({ label: 'x', expiresInSec: 3600 }, bearer(t.token)) : { method, headers: bearer(t.token) });
+      assert.equal(res.status, 401, `${method} ${path}`);
+      assert.equal(res.headers.get('www-authenticate'), 'Bearer');
+      assert.equal(await errorCode(res), 'unauthorized');
+    }
+    // 未定義のパス・未対応メソッドは認証を通ってから 404 / 405
+    assert.equal((await fetch(`${c.base}/v1/nope`, { headers: bearer(t.token) })).status, 404);
+    assert.equal((await fetch(`${c.base}/v1/engines`, { method: 'DELETE', headers: bearer(t.token) })).status, 405);
+    // TTS_TOKEN では発行・一覧・失効ができない
+    assert.equal((await issue(c, USER)).status, 401);
+    assert.equal((await fetch(`${c.base}/v1/admin/tokens`, { headers: bearer(USER) })).status, 401);
+    assert.equal((await fetch(`${c.base}/v1/admin/tokens/${t.id}`, { method: 'DELETE', headers: bearer(USER) })).status, 401);
+    // 発行したものはまだ使える
+    assert.equal((await fetch(`${c.base}/v1/engines`, { headers: bearer(t.token) })).status, 200);
+  } finally {
+    await c.stop();
+  }
+});
+
+test('API トークン: 構成 C（TTS_TOKEN だけ）では TTS_TOKEN で発行でき、発行トークンは管理 API に 401', async () => {
+  const c = await start({ TTS_TOKEN: USER });
+  try {
+    const t = await issued(c, USER);
+    assert.deepEqual(await userApis(c, t.token), [200, 200, 200, 200]);
+    assert.equal((await fetch(`${c.base}/v1/admin/status`, { headers: bearer(t.token) })).status, 401);
+    assert.equal((await fetch(`${c.base}/v1/admin/tokens`, { headers: bearer(t.token) })).status, 401);
+    assert.equal((await fetch(`${c.base}/v1/admin/status`, { headers: bearer(USER) })).status, 200);
+  } finally {
+    await c.stop();
+  }
+});
+
+test('API トークン: 構成 A・B では発行は 409、一覧は enabled: false。B の通常 API は何を付けても 200', async () => {
+  const a = await start();
+  try {
+    const r = await issue(a, undefined);
+    assert.equal(r.status, 409);
+    assert.deepEqual(await r.json(), { error: { code: 'conflict', message: 'API tokens require TTS_TOKEN to be set' } });
+    assert.deepEqual(await (await fetch(`${a.base}/v1/admin/tokens`)).json(), { enabled: false, tokens: [] });
+  } finally {
+    await a.stop();
+  }
+  const b = await start({ TTS_ADMIN_TOKEN: ADMIN });
+  try {
+    assert.equal((await issue(b, ADMIN)).status, 409);
+    assert.equal((await issue(b, undefined)).status, 401);
+    assert.deepEqual(await (await fetch(`${b.base}/v1/admin/tokens`, { headers: bearer(ADMIN) })).json(), { enabled: false, tokens: [] });
+    for (const token of [undefined, 'whatever', `ttsg_${'0'.repeat(8)}_${'0'.repeat(48)}`, ADMIN]) {
+      assert.equal((await fetch(`${b.base}/v1/engines`, { headers: bearer(token) })).status, 200, String(token));
+    }
+  } finally {
+    await b.stop();
+  }
+});
+
+test('API トークン: 期限切れと失効後は 401。失効は 204、2 回目・無い id・形の違う id は 404', async () => {
+  let t = T0;
+  const c = await start({ TTS_TOKEN: USER, TTS_ADMIN_TOKEN: ADMIN }, { now: () => t });
+  try {
+    const short = await issued(c, ADMIN, { label: 'short', expiresInSec: 3600 });
+    const long = await issued(c, ADMIN, { label: 'long', expiresInSec: 86400 });
+    t = T0 + 3_600_000 - 1;
+    assert.equal((await fetch(`${c.base}/v1/engines`, { headers: bearer(short.token) })).status, 200);
+    t = T0 + 3_600_000;
+    assert.equal((await fetch(`${c.base}/v1/engines`, { headers: bearer(short.token) })).status, 401);
+    assert.equal((await fetch(`${c.base}/v1/engines`, { headers: bearer(long.token) })).status, 200);
+    const del = (id: string) => fetch(`${c.base}/v1/admin/tokens/${id}`, { method: 'DELETE', headers: bearer(ADMIN) });
+    const r = await del(long.id);
+    assert.equal(r.status, 204);
+    assert.equal(await r.text(), '');
+    assert.equal((await fetch(`${c.base}/v1/engines`, { headers: bearer(long.token) })).status, 401);
+    let nf = await del(long.id);
+    assert.equal(nf.status, 404);
+    assert.deepEqual(await nf.json(), { error: { code: 'not_found', message: `token ${long.id} not found` } });
+    nf = await del('zzz');
+    assert.equal(nf.status, 404);
+    assert.equal(await errorCode(nf), 'not_found');
+    assert.equal((await del('00000000')).status, 404);
+    // 期限切れも消せる
+    assert.equal((await del(short.id)).status, 204);
+    // 本文の Content-Type 違いは 415
+    const bad = await fetch(`${c.base}/v1/admin/tokens/${short.id}`, { method: 'DELETE', headers: { ...bearer(ADMIN), 'Content-Type': 'text/plain' }, body: 'x' });
+    assert.equal(bad.status, 415);
+  } finally {
+    await c.stop();
+  }
+});
+
+test('API トークン: 本文の検査（400 と field）・415・ラベルの trim', async () => {
+  const c = await start({ TTS_TOKEN: USER, TTS_ADMIN_TOKEN: ADMIN });
+  try {
+    const cases: [unknown, string, string][] = [
+      [{ label: 'a', expiresInSec: 3600, x: 1 }, 'x', 'unknown field x'],
+      [{ expiresInSec: 3600 }, 'label', 'label is required'],
+      [{ label: '   ', expiresInSec: 3600 }, 'label', 'label must be 1 to 40 characters'],
+      [{ label: 'あ'.repeat(41), expiresInSec: 3600 }, 'label', 'label must be 1 to 40 characters'],
+      [{ label: 'a\u0007b', expiresInSec: 3600 }, 'label', 'label must not contain control characters'],
+      [{ label: 1, expiresInSec: 3600 }, 'label', 'label must be a string'],
+      [{ label: 'a' }, 'expiresInSec', 'expiresInSec is required'],
+      [{ label: 'a', expiresInSec: 60 }, 'expiresInSec', 'expiresInSec must be one of 3600, 86400, 604800, 2592000'],
+      [{ label: 'a', expiresInSec: '3600' }, 'expiresInSec', 'expiresInSec must be one of 3600, 86400, 604800, 2592000'],
+    ];
+    for (const [body, field, message] of cases) {
+      const r = await issue(c, ADMIN, body);
+      assert.equal(r.status, 400, JSON.stringify(body));
+      assert.deepEqual(await r.json(), { error: { code: 'invalid_request', message, field } }, JSON.stringify(body));
+    }
+    const r = await fetch(`${c.base}/v1/admin/tokens`, { method: 'POST', headers: { ...bearer(ADMIN), 'Content-Type': 'text/plain' }, body: '{}' });
+    assert.equal(r.status, 415);
+    assert.equal((await issued(c, ADMIN, { label: '字'.repeat(40), expiresInSec: 2592000 })).label, '字'.repeat(40));
+    const trimmed = await issued(c, ADMIN, { label: '  計測 Bot  ', expiresInSec: 604800 });
+    assert.equal(trimmed.label, '計測 Bot');
+    assert.equal(c.app.tokens.list().length, 2);
+  } finally {
+    await c.stop();
+  }
+});
+
+test('API トークン: 有効 20 件を超える発行は 400（field なし）', async () => {
+  const c = await start({ TTS_TOKEN: USER });
+  try {
+    for (let i = 0; i < 20; i++) await issued(c, USER, { label: `t${i}`, expiresInSec: 3600 });
+    const r = await issue(c, USER);
+    assert.equal(r.status, 400);
+    assert.deepEqual(await r.json(), { error: { code: 'invalid_request', message: 'too many active tokens (up to 20)' } });
+  } finally {
+    await c.stop();
+  }
+});
+
+test('API トークン: 一覧は新しい順、使用後に lastUsedAt、期限切れは expired', async () => {
+  let t = T0;
+  const c = await start({ TTS_TOKEN: USER, TTS_ADMIN_TOKEN: ADMIN }, { now: () => t });
+  try {
+    const a = await issued(c, ADMIN, { label: 'a', expiresInSec: 3600 });
+    t += 1000;
+    const b = await issued(c, ADMIN, { label: 'b', expiresInSec: 86400 });
+    const b2 = await issued(c, ADMIN, { label: 'b2', expiresInSec: 86400 });
+    const list = async () => (await (await fetch(`${c.base}/v1/admin/tokens`, { headers: bearer(ADMIN) })).json()) as { enabled: boolean; tokens: (Omit<Issued, 'token'> & { hash?: string; token?: string })[] };
+    let l = await list();
+    assert.equal(l.enabled, true);
+    // 同じ時刻は追加の新しい順
+    assert.deepEqual(l.tokens.map(x => x.id), [b2.id, b.id, a.id]);
+    assert.ok(l.tokens.every(x => x.hash === undefined && x.token === undefined));
+    t += 4000;
+    assert.equal((await fetch(`${c.base}/v1/engines`, { headers: bearer(a.token) })).status, 200);
+    l = await list();
+    assert.equal(l.tokens.find(x => x.id === a.id)!.lastUsedAt, '2026-01-01T00:00:05Z');
+    assert.equal(l.tokens.find(x => x.id === b.id)!.lastUsedAt, null);
+    t = T0 + 3_600_000;
+    l = await list();
+    assert.deepEqual(l.tokens.map(x => [x.label, x.expired]), [['b2', false], ['b', false], ['a', true]]);
+  } finally {
+    await c.stop();
+  }
+});
+
+test('API トークン: ログに値・secret・hash が出ない。発行・失効のログと tokenId', async () => {
+  const c = await start({ TTS_TOKEN: USER, TTS_ADMIN_TOKEN: ADMIN });
+  const log = captureLog('debug');
+  try {
+    const t = await issued(c, ADMIN, { label: 'bot', expiresInSec: 3600 });
+    const hash = createHash('sha256').update(t.token).digest('hex');
+    await (await fetch(`${c.base}/v1/engines`, { headers: { ...bearer(t.token), 'X-Request-Id': 'rid-issued' } })).arrayBuffer();
+    await (await fetch(`${c.base}/v1/engines`, { headers: { ...bearer(USER), 'X-Request-Id': 'rid-user' } })).arrayBuffer();
+    await (await fetch(`${c.base}/v1/engines`, { headers: { ...bearer(`${t.token}0`), 'X-Request-Id': 'rid-401' } })).arrayBuffer();
+    await (await fetch(`${c.base}/v1/admin/status`, { headers: { ...bearer(t.token), 'X-Request-Id': 'rid-admin-401' } })).arrayBuffer();
+    const d = await fetch(`${c.base}/v1/admin/tokens/${t.id}`, { method: 'DELETE', headers: { ...bearer(ADMIN), 'X-Request-Id': 'rid-revoke' } });
+    assert.equal(d.status, 204);
+    await (await fetch(`${c.base}/v1/engines`, { headers: { ...bearer(t.token), 'X-Request-Id': 'rid-revoked' } })).arrayBuffer();
+    await waitFor(() => log.lines.filter(l => l.msg === 'request').length >= 7);
+
+    const all = log.raw.join('\n');
+    assert.ok(!all.includes(t.token));
+    assert.ok(!all.includes(t.token.slice(14)));
+    assert.ok(!all.includes(hash));
+
+    const issuedLog = log.lines.find(l => l.msg === 'api token issued')!;
+    assert.equal(issuedLog.level, 'info');
+    assert.equal(issuedLog.tokenId, t.id);
+    assert.equal(issuedLog.label, 'bot');
+    assert.equal(issuedLog.expiresAt, t.expiresAt);
+    assert.equal(issuedLog.method, 'POST');
+    assert.equal(issuedLog.path, '/v1/admin/tokens');
+    assert.equal(typeof issuedLog.requestId, 'string');
+    const revoked = log.lines.find(l => l.msg === 'api token revoked')!;
+    assert.equal(revoked.tokenId, t.id);
+    assert.equal(revoked.label, 'bot');
+    assert.equal(revoked.requestId, 'rid-revoke');
+
+    const req = (rid: string) => log.lines.find(l => l.msg === 'request' && l.requestId === rid)!;
+    assert.equal(req('rid-issued').tokenId, t.id);
+    assert.equal(req('rid-issued').status, 200);
+    for (const rid of ['rid-user', 'rid-401', 'rid-admin-401', 'rid-revoked']) assert.equal(req(rid).tokenId, undefined, rid);
+    assert.equal(req('rid-401').status, 401);
+    assert.equal(req('rid-admin-401').status, 401);
+  } finally {
+    log.stop();
+    await c.stop();
+  }
+});
+
+test('API トークン: close で lastUsedAt がファイルに書かれる。ファイルは 0600', async () => {
+  let t = T0;
+  const c = await start({ TTS_TOKEN: USER }, { now: () => t });
+  const path = join(c.app.config.dataDir, 'api-tokens.json');
+  try {
+    const tk = await issued(c, USER);
+    assert.equal((await stat(path)).mode & 0o777, 0o600);
+    t += 7000;
+    assert.equal((await fetch(`${c.base}/v1/engines`, { headers: bearer(tk.token) })).status, 200);
+    const read = async () => JSON.parse(await readFile(path, 'utf8')) as { tokens: { lastUsedAt: string | null }[] };
+    assert.equal((await read()).tokens[0]!.lastUsedAt, null);
+    await c.app.close();
+    assert.equal((await read()).tokens[0]!.lastUsedAt, '2026-01-01T00:00:07Z');
+    assert.ok(!(await readFile(path, 'utf8')).includes(tk.token));
+  } finally {
+    await c.stop();
+  }
+});
+
+test('API トークン: 設定画面に API トークンのカードがある', async () => {
+  const c = await start();
+  try {
+    const html = await (await fetch(`${c.base}/admin/`)).text();
+    assert.match(html, /id="apitokens-card"/);
+  } finally {
+    await c.stop();
   }
 });

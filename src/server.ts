@@ -4,7 +4,7 @@
  * - 許可リスト外の接続元は全パスで 403。Host が TTS_HOSTS:TTS_PORT・localhost:TTS_PORT・TTS_ALLOWED_HOSTS 以外なら 421、
  *   GET / HEAD / OPTIONS 以外で Origin の host が同じ許可に入らなければ 403（DNS rebinding・CSRF 対策）
  * - 認証は TTS_TOKEN があれば /healthz・/health*・設定画面の静的ファイル以外で必須（TTS_ADMIN_TOKEN でも通る）、
- *   /v1/admin/* は TTS_ADMIN_TOKEN があればその値（無ければ TTS_TOKEN の規則）
+ *   /v1/admin/* は TTS_ADMIN_TOKEN があればその値（無ければ TTS_TOKEN の規則）。発行トークン（api-tokens.json）は通常の API だけ
  * - 本文は application/json だけ（ほかは 415）。CORS ヘッダは返さない
  * - 全応答に X-Request-Id を付け、応答が終わったらアクセスログを 1 行出す（ヘッダ・本文・クエリは出さない）
  */
@@ -28,7 +28,8 @@ import { SynthQueue } from './queue.ts';
 import { SettingsStore, validateSettingsPatch } from './settings.ts';
 import { Synthesizer } from './synthesize.ts';
 import { Dictionary } from './text/readings.ts';
-import { checkKeys, checkObject, checkReading, checkString, checkSurface } from './validate.ts';
+import { EXPIRES_IN_SEC, FLUSH_INTERVAL_MS, MAX_LABEL_CHARS, TokenStore, type TokenView } from './tokens.ts';
+import { charCount, checkEnum, checkKeys, checkObject, checkReading, checkString, checkSurface } from './validate.ts';
 
 export type App = {
   config: Config;
@@ -41,6 +42,8 @@ export type App = {
   catalog: CatalogModel[];
   downloader: ModelDownloader;
   synth: Synthesizer;
+  /** 発行した API トークン */
+  tokens: TokenStore;
   /** ffmpeg の有無（30 秒たてば確かめ直す） */
   ffmpeg: FfmpegProbe;
   startedAt: number;
@@ -56,11 +59,14 @@ export type AppOverrides = {
   isHostAllowed?: (host: string) => boolean;
   protocols?: readonly string[];
   isPortAllowed?: (port: number) => boolean;
+  /** テスト用: 発行トークンの時刻 */
+  now?: () => number;
 };
 
 export const createApp = async (config: Config, o: AppOverrides = {}): Promise<App> => {
   const settings = await SettingsStore.load(config.dataDir);
   const registry = await Registry.load(config.dataDir, engine => MODEL_EXTS[engine]);
+  const tokens = await TokenStore.load(config.dataDir, o.now);
   const engines = (o.engines ?? createEngines)({ registry, settings: () => settings.get(), concurrency: config.concurrency });
   const cache = new AudioCache({
     dir: config.cacheDir,
@@ -95,14 +101,19 @@ export const createApp = async (config: Config, o: AppOverrides = {}): Promise<A
   // 作ってから TTL を過ぎたものを 1 時間ごとに消す
   const sweep = setInterval(() => void cache.evict().catch(() => {}), 3_600_000);
   sweep.unref();
+  // 発行トークンの掃除と最終使用時刻の書き込み
+  const tokenTimer = setInterval(() => void tokens.tick(), FLUSH_INTERVAL_MS);
+  tokenTimer.unref();
   const app: App = {
-    config, engines, registry, settings, cache, queue, dictionary, catalog, downloader, synth, ffmpeg, startedAt: Date.now(),
+    config, engines, registry, settings, cache, queue, dictionary, catalog, downloader, synth, tokens, ffmpeg, startedAt: Date.now(),
     shuttingDown: false,
     close: async () => {
       app.shuttingDown = true;
       clearInterval(sweep);
+      clearInterval(tokenTimer);
       await downloader.cancelAll();
       await Promise.all([...engines.values()].map(e => e.close()));
+      await tokens.flush().catch(e => log.warn('cannot write api-tokens.json', { err: e }));
     },
   };
   return app;
@@ -179,25 +190,40 @@ const noBody = async (req: IncomingMessage): Promise<void> => {
 
 const digest = (s: string): Buffer => createHash('sha256').update(s).digest();
 
-const tokenMatches = (req: IncomingMessage, token: string): boolean => {
+/** Authorization: Bearer の値。無ければ null */
+const bearerOf = (req: IncomingMessage): string | null => {
   const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? '');
-  return !!m && timingSafeEqual(digest(m[1]!.trim()), digest(token));
+  return m ? m[1]!.trim() : null;
 };
 
-/** 管理ルートは TTS_ADMIN_TOKEN（無ければ TTS_TOKEN）。ほかは TTS_TOKEN があれば必須で、TTS_ADMIN_TOKEN でも通る */
-const requireAuth = (req: IncomingMessage, config: Config, admin: boolean): void => {
+const tokenMatches = (presented: string | null, token: string): boolean =>
+  presented !== null && timingSafeEqual(digest(presented), digest(token));
+
+/**
+ * 管理ルートは TTS_ADMIN_TOKEN（無ければ TTS_TOKEN）。ほかは TTS_TOKEN があれば必須で、TTS_ADMIN_TOKEN・有効な発行トークンでも通る。
+ * 発行トークンで通ったときはその id を返す（アクセスログに付ける）
+ */
+const requireAuth = (req: IncomingMessage, app: App, admin: boolean): string | undefined => {
+  const { config } = app;
+  const presented = bearerOf(req);
   let ok: boolean;
   if (admin) {
     const token = config.adminToken || config.token;
-    if (!token) return;
-    ok = tokenMatches(req, token);
+    if (!token) return undefined;
+    ok = tokenMatches(presented, token);
   } else {
-    if (!config.token) return;
-    const user = tokenMatches(req, config.token);
-    const adminOk = !!config.adminToken && tokenMatches(req, config.adminToken);
+    if (!config.token) return undefined;
+    const user = tokenMatches(presented, config.token);
+    const adminOk = !!config.adminToken && tokenMatches(presented, config.adminToken);
     ok = user || adminOk;
+    if (!ok && presented !== null) {
+      // 環境変数のトークンの後に発行トークンを見る
+      const id = app.tokens.verify(presented);
+      if (id !== null) return id;
+    }
   }
   if (!ok) throw new ApiError(401, 'unauthorized', 'missing or invalid bearer token');
+  return undefined;
 };
 
 // ---- Host / Origin ----
@@ -380,6 +406,20 @@ const deleteModel = async (app: App, engineId: string, id: string): Promise<void
   });
 };
 
+const issueToken = async (app: App, raw: unknown, f: ReqFields): Promise<{ view: TokenView; token: string }> => {
+  const body = checkObject(raw, '');
+  checkKeys(body, ['label', 'expiresInSec']);
+  if (body.label === undefined) throw invalid('label is required', 'label');
+  const label = checkString(body.label, 'label').trim();
+  if (!label || charCount(label) > MAX_LABEL_CHARS) throw invalid(`label must be 1 to ${MAX_LABEL_CHARS} characters`, 'label');
+  if (/\p{Cc}/u.test(label)) throw invalid('label must not contain control characters', 'label');
+  if (body.expiresInSec === undefined) throw invalid('expiresInSec is required', 'expiresInSec');
+  const expiresInSec = checkEnum(body.expiresInSec, 'expiresInSec', EXPIRES_IN_SEC);
+  const r = await app.tokens.issue(label, expiresInSec);
+  log.info('api token issued', { ...f, tokenId: r.view.id, label, expiresAt: r.view.expiresAt });
+  return r;
+};
+
 const decodeSegment = (s: string): string => {
   try {
     return decodeURIComponent(s);
@@ -400,7 +440,7 @@ const putReading = async (app: App, rawSurface: string, raw: unknown): Promise<v
 // ---- ルーティング ----
 
 /** ログに付ける要求の情報 */
-type ReqFields = { requestId: string; method: string; path: string };
+type ReqFields = { requestId: string; method: string; path: string; tokenId?: string };
 
 type Route = {
   method: string; re: RegExp; admin: boolean; auth: boolean;
@@ -578,6 +618,34 @@ const routes: Route[] = [
     },
   },
   {
+    method: 'GET', re: /^\/v1\/admin\/tokens$/, admin: true, auth: true,
+    run: async (app, req, res) => {
+      await noBody(req);
+      sendJson(res, 200, { enabled: !!app.config.token, tokens: app.tokens.list() });
+    },
+  },
+  {
+    method: 'POST', re: /^\/v1\/admin\/tokens$/, admin: true, auth: true,
+    run: async (app, req, res, _m, f) => {
+      const raw = await readJson(req);
+      // TTS_TOKEN が無い構成では通常の API に認証が無く、発行しても意味が無い
+      if (!app.config.token) throw conflict('API tokens require TTS_TOKEN to be set');
+      const { view, token } = await issueToken(app, raw, f);
+      sendJson(res, 201, { ...view, token });
+    },
+  },
+  {
+    method: 'DELETE', re: /^\/v1\/admin\/tokens\/([^/]+)$/, admin: true, auth: true,
+    run: async (app, req, res, m, f) => {
+      await noBody(req);
+      const id = decodeSegment(m[1]!);
+      const rec = await app.tokens.revoke(id);
+      if (!rec) throw notFound(`token ${id} not found`);
+      log.info('api token revoked', { ...f, tokenId: rec.id, label: rec.label });
+      sendEmpty(res, 204);
+    },
+  },
+  {
     method: 'DELETE', re: /^\/v1\/admin\/cache$/, admin: true, auth: true,
     run: async (app, req, res) => {
       await noBody(req);
@@ -649,17 +717,24 @@ export const createHandler = (app: App): RequestListener => {
       const matched = routes.filter(r => r.re.test(path));
       const r = matched.find(x => x.method === method);
       if (r) {
-        if (r.auth) requireAuth(req, app.config, r.admin);
+        if (r.auth) {
+          const tokenId = requireAuth(req, app, r.admin);
+          if (tokenId) f.tokenId = tokenId;
+        }
         await r.run(app, req, res, r.re.exec(path)!, f);
         return;
       }
       if (matched.length > 0) {
         // 同じパスのルートは認証の要否が同じ
-        if (matched[0]!.auth) requireAuth(req, app.config, matched[0]!.admin);
+        if (matched[0]!.auth) {
+          const tokenId = requireAuth(req, app, matched[0]!.admin);
+          if (tokenId) f.tokenId = tokenId;
+        }
         throw methodNotAllowed(method, path, matched.map(x => x.method).join(', '));
       }
       // 未定義のパスも、トークンが要る構成なら先に 401（どのパスがあるかを未認証で探らせない）
-      requireAuth(req, app.config, path.startsWith('/v1/admin/'));
+      const tokenId = requireAuth(req, app, path.startsWith('/v1/admin/'));
+      if (tokenId) f.tokenId = tokenId;
       throw notFound(`${method} ${path} not found`);
     } catch (e) {
       if (res.headersSent) {

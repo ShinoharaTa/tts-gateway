@@ -148,6 +148,38 @@
       <p class="msg" id="settings-msg" role="status"></p>
     </section>
 
+    <section class="card" id="apitokens-card">
+      <h2>API トークン</h2>
+      <p class="muted">期限つきのトークンを発行します。通常の API（合成・読み・辞書の取得）にだけ使え、この設定画面や管理 API には使えません。</p>
+      <p class="muted" id="apitokens-disabled" hidden>このサーバーは TTS_TOKEN が未設定で、通常の API に認証がありません。発行するには TTS_TOKEN を設定してください。</p>
+      <form id="apitokens-form" class="stack">
+        <div class="grid two">
+          <label class="field"><span>ラベル（用途のメモ、40 字まで）</span><input id="apitokens-label" required maxlength="40" autocomplete="off" placeholder="例: Pixel / 計測 Bot"></label>
+          <label class="field"><span>期限</span>
+            <select id="apitokens-expires">
+              <option value="3600">1 時間</option>
+              <option value="86400" selected>24 時間</option>
+              <option value="604800">7 日</option>
+              <option value="2592000">30 日</option>
+            </select>
+          </label>
+        </div>
+        <div class="row"><button type="submit" id="apitokens-submit">発行</button></div>
+      </form>
+      <div id="apitokens-new" class="token-new" hidden>
+        <h3>発行しました</h3>
+        <textarea id="apitokens-value" class="token-value" rows="2" readonly spellcheck="false" autocapitalize="off" aria-label="発行したトークン"></textarea>
+        <p class="msg error">この値が見られるのは今だけです。画面を閉じる・再読み込みすると二度と表示できません（サーバーにも保存していません）。なくしたら失効して発行し直してください。</p>
+        <div class="row">
+          <button type="button" id="apitokens-copy">コピー</button>
+          <button type="button" class="ghost" id="apitokens-close">閉じる</button>
+        </div>
+      </div>
+      <p class="msg" id="apitokens-msg" role="status"></p>
+      <h3>発行済み</h3>
+      <ul class="list" id="apitokens"></ul>
+    </section>
+
     <section class="card" id="credit-card">
       <h2>クレジット</h2>
       <p class="credit">音声合成：ZEN-TTS（<a href="https://zenryokukikai.com" target="_blank" rel="noopener">https://zenryokukikai.com</a>）</p>

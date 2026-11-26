@@ -416,11 +416,107 @@ const saveSettings = async ev => {
   }
 };
 
+// ---- API トークン ----
+
+const fmtTime = iso => new Date(iso).toLocaleString('ja-JP', { dateStyle: 'short', timeStyle: 'short' });
+const tokenHint = t => `ttsg_${t.id}_…`;
+
+const loadApiTokens = async () => {
+  try {
+    const { enabled, tokens } = await api('/v1/admin/tokens');
+    $('apitokens-disabled').hidden = enabled;
+    $('apitokens-form').hidden = !enabled;
+    $('apitokens').replaceChildren(...(tokens.length ? tokens.map(apiTokenItem) : [h('li', { class: 'muted' }, 'まだありません。')]));
+  } catch (e) {
+    setMsg('apitokens-msg', errText(e), 'error');
+  }
+};
+
+const apiTokenItem = t => {
+  const left = Math.floor((Date.parse(t.expiresAt) - Date.now()) / 1000);
+  return h(
+    'li',
+    {},
+    h(
+      'div',
+      { class: 'head' },
+      h('span', { class: 'name' }, t.label),
+      h('span', { class: 'muted small' }, tokenHint(t)),
+      t.expired ? h('span', { class: 'badge error' }, '期限切れ') : h('span', { class: 'badge installed' }, '有効'),
+    ),
+    h(
+      'div',
+      { class: 'head' },
+      h('span', { class: 'muted small' }, t.expired ? `期限 ${fmtTime(t.expiresAt)}` : `期限 ${fmtTime(t.expiresAt)}（あと ${duration(Math.max(left, 0))}）`),
+      h('span', { class: 'muted small' }, t.lastUsedAt ? `最終使用 ${fmtTime(t.lastUsedAt)}` : '未使用'),
+    ),
+    h(
+      'div',
+      { class: 'actions' },
+      h('button', { type: 'button', class: 'ghost danger small-button', onclick: () => removeApiToken(t) }, t.expired ? '削除' : '失効'),
+    ),
+  );
+};
+
+const removeApiToken = async t => {
+  const ok = t.expired
+    ? confirm(`「${t.label}」を一覧から消します。よろしいですか？`)
+    : confirm(`「${t.label}」（${tokenHint(t)}）を失効します。このトークンを使っている端末・Bot は使えなくなります。よろしいですか？`);
+  if (!ok) return;
+  try {
+    await api(`/v1/admin/tokens/${encodeURIComponent(t.id)}`, { method: 'DELETE' });
+    setMsg('apitokens-msg', t.expired ? '消しました' : '失効しました', 'ok');
+  } catch (e) {
+    setMsg('apitokens-msg', errText(e), 'error');
+  }
+  await loadApiTokens();
+};
+
+const issueApiToken = async ev => {
+  ev.preventDefault();
+  const body = { label: $('apitokens-label').value.trim(), expiresInSec: Number($('apitokens-expires').value) };
+  $('apitokens-submit').disabled = true;
+  try {
+    const t = await api('/v1/admin/tokens', { method: 'POST', body });
+    // 値は DOM にだけ置く（localStorage などに入れない）
+    $('apitokens-value').value = t.token;
+    $('apitokens-new').hidden = false;
+    $('apitokens-form').reset();
+    setMsg('apitokens-msg', '');
+    await loadApiTokens();
+    $('apitokens-new').scrollIntoView({ block: 'nearest' });
+  } catch (e) {
+    setMsg('apitokens-msg', errText(e), 'error');
+  } finally {
+    $('apitokens-submit').disabled = false;
+  }
+};
+
+/** Clipboard API（HTTPS など）→ 選択して execCommand('copy') → 選択したまま長押しを案内 */
+const copyApiToken = async () => {
+  const el = $('apitokens-value');
+  if (window.isSecureContext && navigator.clipboard) {
+    try {
+      await navigator.clipboard.writeText(el.value);
+      setMsg('apitokens-msg', 'コピーしました', 'ok');
+      return;
+    } catch {}
+  }
+  el.focus();
+  el.setSelectionRange(0, el.value.length);
+  let copied = false;
+  try {
+    copied = document.execCommand('copy');
+  } catch {}
+  if (copied) setMsg('apitokens-msg', 'コピーしました', 'ok');
+  else setMsg('apitokens-msg', 'コピーできませんでした。選択された値を長押しでコピーしてください', 'error');
+};
+
 // ---- 起動 ----
 
 const loadAll = async () => {
   await loadSettings();
-  await Promise.all([loadStatus(), loadVoices().catch(e => setMsg('try-msg', errText(e), 'error')), loadModels(), loadDict()]);
+  await Promise.all([loadStatus(), loadVoices().catch(e => setMsg('try-msg', errText(e), 'error')), loadModels(), loadDict(), loadApiTokens()]);
 };
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -478,6 +574,13 @@ document.addEventListener('DOMContentLoaded', () => {
   $('dict-filter').addEventListener('input', () => {
     clearTimeout(dictFilterTimer);
     dictFilterTimer = setTimeout(renderDict, 150);
+  });
+
+  $('apitokens-form').addEventListener('submit', issueApiToken);
+  $('apitokens-copy').addEventListener('click', () => void copyApiToken());
+  $('apitokens-close').addEventListener('click', () => {
+    $('apitokens-value').value = '';
+    $('apitokens-new').hidden = true;
   });
 
   $('settings-form').addEventListener('submit', saveSettings);

@@ -10,6 +10,7 @@ info:
     - `TTS_TOKEN` を設定したときだけ、`/healthz`・`/health`・`/health/live`・`/health/ready` と設定画面（`/admin/`）以外で `Authorization: Bearer <TTS_TOKEN>` が必須（`TTS_ADMIN_TOKEN` でも通る）。
       `/v1/admin/*` は `TTS_ADMIN_TOKEN` を設定したときだけその値が必須（未設定なら `TTS_TOKEN` の規則）。
       認証はパスの有無より先（トークンが要る構成では、未定義のパス・未対応のメソッドも未認証なら 401）。
+      設定画面で発行した API トークン（`ttsg_…`、POST /v1/admin/tokens）は、`TTS_TOKEN` が要る通常の API（`/v1/admin/*` 以外）に使える。`/v1/admin/*` には使えない（401）。期限切れ・失効済みも 401。`TTS_TOKEN` が無い構成では発行できない。
     - `TTS_ALLOW_CIDRS` に入らない接続元は 403（`forbidden`）。CORS ヘッダは返さない。
     - `Host` が `TTS_HOSTS` の各アドレス:`TTS_PORT`（IPv6 は `[::1]:8710`。ポート 80 ならポート無しも可）・ループバックで待ち受けるときの `localhost:<port>`・`TTS_ALLOWED_HOSTS` のホスト名（ポートは問わない）以外、または無ければ全パスで 421（`misdirected_request`）。
     - GET / HEAD / OPTIONS 以外で `Origin` があり、その host（ポート含む）が上の Host の許可に入らなければ 403（`forbidden_origin`）。`Origin: null` も 403。
@@ -573,6 +574,87 @@ paths:
           $ref: '#/components/responses/UnsupportedMediaType'
         '421':
           $ref: '#/components/responses/MisdirectedRequest'
+  /v1/admin/tokens:
+    get:
+      operationId: listApiTokens
+      tags: [admin]
+      summary: 発行した API トークンの一覧
+      description: |
+        createdAt の新しい順（同時刻は発行の新しい順）。トークンの値・ハッシュは返さない。失効したものは載らない。
+        期限切れは expired が true になり、期限から 7 日後に一覧から消える（DELETE でも消せる）。
+        lastUsedAt は一覧には即時に出るが、ファイルへの保存は最大 60 秒遅れる。
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiTokensResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
+    post:
+      operationId: issueApiToken
+      tags: [admin]
+      summary: 期限つきの API トークンを発行する
+      description: |
+        値（token）を返すのはこの応答の 1 回だけ（サーバーはハッシュだけを保存する）。形式は `ttsg_` + id（hex 8 桁）+ `_` + hex 48 桁（全 62 字）。
+        使えるのは通常の API（GET /v1/engines・POST /v1/synthesize・POST /v1/normalize・GET /v1/dictionary）だけで、/v1/admin/* は 401。
+        label は必須で前後の空白を落として 1〜40 字（コードポイント数）、制御文字は不可、同じラベルも可。
+        expiresInSec は 3600（1 時間）/ 86400（24 時間）/ 604800（7 日）/ 2592000（30 日）のどれか。
+        期限内のトークンは 20 件まで（超える発行は 400、field なし）。
+        TTS_TOKEN が無い構成（通常の API に認証が無い）では 409 conflict（本文の検査より先）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApiTokenIssueRequest'
+      responses:
+        '201':
+          description: 発行した
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiTokenIssued'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
+  /v1/admin/tokens/{id}:
+    parameters:
+      - $ref: '#/components/parameters/TokenId'
+    delete:
+      operationId: revokeApiToken
+      tags: [admin]
+      summary: API トークンを失効する（期限切れなら一覧から消す）
+      description: |
+        次の要求から 401 になる。無い id・形の違う id は 404（`token <id> not found`）。
+        ファイルへの書き込みに失敗したら 500 を返すが、メモリでは消えたまま（60 秒ごとに書き直す）。書けないまま再起動するとそのトークンは戻る。
+      responses:
+        '204':
+          description: 失効した
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '421':
+          $ref: '#/components/responses/MisdirectedRequest'
   /v1/admin/cache:
     delete:
       operationId: clearCache
@@ -594,7 +676,7 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
-      description: TTS_TOKEN（/v1/admin/* は TTS_ADMIN_TOKEN があればその値）。どちらも未設定なら不要
+      description: TTS_TOKEN（/v1/admin/* は TTS_ADMIN_TOKEN があればその値）。どちらも未設定なら不要。設定画面で発行した API トークン（ttsg_…）は /v1/admin/* 以外に使える（/v1/admin/* は 401。期限切れ・失効済みも 401。TTS_TOKEN が無い構成では発行できない）
   parameters:
     Engine:
       name: engine
@@ -610,6 +692,14 @@ components:
       schema:
         type: string
         pattern: '^[a-z0-9][a-z0-9_-]{0,31}$'
+    TokenId:
+      name: id
+      in: path
+      required: true
+      description: API トークンの id（値の `ttsg_` の後の 8 桁）
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{8}$'
   responses:
     BadRequest:
       description: パラメータ不正（範囲外・型違い・未知のフィールド・そのエンジンが対応しないオプション・本文が 1MB 超。`invalid_request`）、解釈できないリクエストターゲット（`bad_request`）
@@ -641,7 +731,7 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
     Conflict:
-      description: 同じ id のモデルがある・ダウンロード中（取得の要求が重なった）・削除の処理中・既定の声 など
+      description: 同じ id のモデルがある・ダウンロード中（取得の要求が重なった）・削除の処理中・既定の声・TTS_TOKEN が無く API トークンを発行できない など
       content:
         application/json:
           schema:
@@ -1478,3 +1568,80 @@ components:
         catalog:
           type: string
           description: catalog/*.json の id
+    ApiToken:
+      type: object
+      additionalProperties: false
+      required: [id, label, createdAt, expiresAt, lastUsedAt, expired]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9a-f]{8}$'
+        label:
+          type: string
+          minLength: 1
+          maxLength: 40
+        createdAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+        lastUsedAt:
+          type: [string, 'null']
+          format: date-time
+          description: 最後に認証を通った時刻（未使用なら null）。ファイルへの保存は最大 60 秒遅れる
+        expired:
+          type: boolean
+          description: 期限を過ぎた（期限から 7 日後に一覧から消える）
+    ApiTokensResponse:
+      type: object
+      additionalProperties: false
+      required: [enabled, tokens]
+      properties:
+        enabled:
+          type: boolean
+          description: TTS_TOKEN が設定されている（false なら発行できない）
+        tokens:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApiToken'
+    ApiTokenIssueRequest:
+      type: object
+      additionalProperties: false
+      required: [label, expiresInSec]
+      properties:
+        label:
+          type: string
+          minLength: 1
+          maxLength: 40
+          description: 用途のメモ。前後の空白を落として 1〜40 字（コードポイント数）、制御文字は不可
+        expiresInSec:
+          type: integer
+          enum: [3600, 86400, 604800, 2592000]
+    ApiTokenIssued:
+      type: object
+      additionalProperties: false
+      required: [id, label, createdAt, expiresAt, lastUsedAt, expired, token]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9a-f]{8}$'
+        label:
+          type: string
+          minLength: 1
+          maxLength: 40
+        createdAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+        lastUsedAt:
+          type: [string, 'null']
+          format: date-time
+        expired:
+          type: boolean
+        token:
+          type: string
+          pattern: '^ttsg_[0-9a-f]{8}_[0-9a-f]{48}$'
+          description: トークンの値。返すのはこの応答の 1 回だけ

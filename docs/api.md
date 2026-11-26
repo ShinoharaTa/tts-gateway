@@ -7,6 +7,7 @@
 - 認証: 環境変数 `TTS_TOKEN` を設定したときだけ、`/healthz`・`/health`・`/health/live`・`/health/ready` と設定画面の静的ファイル（`/admin/`。画面で入力したトークンを API の呼び出しに付ける）以外で `Authorization: Bearer <TTS_TOKEN>` が必須。`TTS_ADMIN_TOKEN` でも通る。
   `/v1/admin/*` は `TTS_ADMIN_TOKEN` を設定したときだけ、その値が必須（未設定なら `TTS_TOKEN` の規則に従う）。
   認証はパスの有無より先に行う（トークンが要る構成では、未定義のパス・未対応のメソッドも未認証なら 401）。
+  設定画面で発行した API トークン（`ttsg_…`、[POST /v1/admin/tokens](#post-v1admintokens)）は、`TTS_TOKEN` が要る通常の API（`/v1/admin/*` 以外）に使える。`/v1/admin/*` には使えない（401）。期限切れ・失効済みも 401。`TTS_TOKEN` が無い構成では発行できない。
 - 接続元: `TTS_ALLOW_CIDRS` に入らない接続元は 403（`forbidden`）。
 - Host: `Host` ヘッダが `TTS_HOSTS` の各アドレス:`TTS_PORT`（IPv6 は `[::1]:8710` の形。ポート 80 ならポート無しも可）、`127.0.0.1`・`::1` で待ち受けるときの `localhost:<port>`、`TTS_ALLOWED_HOSTS` のホスト名（ポートは問わない）以外なら全パスで 421（`misdirected_request`）。DNS rebinding 対策。
 - Origin: `GET` / `HEAD` / `OPTIONS` 以外で `Origin` ヘッダがあり、その host（ポート含む）が上の Host の許可に入らなければ 403（`forbidden_origin`）。`Origin: null` も 403。`Origin` が無い要求（curl など）は通す。
@@ -28,7 +29,7 @@
 | 403 | `forbidden_origin` | `Origin` が許可外・`null`（`GET` / `HEAD` / `OPTIONS` 以外） |
 | 404 | `not_found` | エンジン・声・モデル・パスが無い |
 | 405 | `method_not_allowed` | パスはあるがメソッドが違う。`Allow` ヘッダ付き |
-| 409 | `conflict` | 同じ id のモデルがある・ダウンロード中（取得の要求が重なった）・削除の処理中 など |
+| 409 | `conflict` | 同じ id のモデルがある・ダウンロード中（取得の要求が重なった）・削除の処理中・`TTS_TOKEN` が無く API トークンを発行できない など |
 | 413 | `text_too_long` | `text` が上限（`TTS_MAX_CHARS`、既定 2,000 字）を超えた。または前処理と読み辞書を通した後の文が上限の 3 倍（既定 6,000 字）を超えた |
 | 415 | `unsupported_media_type` | JSON 以外の本文（JSON を受ける `POST` / `PUT` は本文が空でも） |
 | 421 | `misdirected_request` | `Host` ヘッダが許可外・無い |
@@ -310,6 +311,55 @@ curl -sS -X POST http://127.0.0.1:8710/v1/synthesize \
 `surface`・`reading` はそれぞれ 100 字まで（超えたら 400、`field` は `surface` / `reading`）。
 組み込み辞書の語を `PUT` すると、ユーザー辞書の値で上書きされる（組み込みの TSV は変えない）。
 `DELETE` で消せるのはユーザー辞書の語だけ（組み込みは 404）。返り値は `GET /v1/dictionary` と同じ形。
+
+### GET /v1/admin/tokens
+
+発行した API トークンの一覧。`createdAt` の新しい順（同時刻は発行の新しい順）。トークンの値・ハッシュは返さない。失効したものは載らない。
+
+```json
+{
+  "enabled": true,
+  "tokens": [
+    { "id": "3f9a1c2e", "label": "Pixel", "createdAt": "2026-11-25T03:00:00Z", "expiresAt": "2026-11-26T03:00:00Z", "lastUsedAt": "2026-11-25T04:10:00Z", "expired": false }
+  ]
+}
+```
+
+- `enabled`: `TTS_TOKEN` が設定されていれば `true`（`false` なら発行できない）。
+- `expired`: 期限を過ぎたら `true`。期限切れは期限から 7 日後に一覧から消える（`DELETE` でも消せる）。
+- `lastUsedAt`: 最後に認証を通った時刻（未使用なら `null`）。一覧には即時に出るが、ファイルへの保存は最大 60 秒遅れる（その間にプロセスが落ちると失われる）。
+
+### POST /v1/admin/tokens
+
+期限つきの API トークンを発行する。`201` で、`GET` の 1 件と同じ項目に `token`（値）を足して返す。**値を返すのはこの応答の 1 回だけ**（サーバーはハッシュだけを保存する）。
+
+```json
+{ "label": "Pixel", "expiresInSec": 86400 }
+```
+
+```json
+{ "id": "3f9a1c2e", "label": "Pixel", "createdAt": "2026-11-25T03:00:00Z", "expiresAt": "2026-11-26T03:00:00Z", "lastUsedAt": null, "expired": false, "token": "ttsg_3f9a1c2e_<48 桁の hex>" }
+```
+
+- 形式: `ttsg_` + id（hex 8 桁）+ `_` + hex 48 桁（全 62 字）。
+- `label`: 必須。前後の空白を落として 1〜40 字（コードポイント数）。制御文字は不可。同じラベルも可。
+- `expiresInSec`: 必須。`3600`（1 時間）/ `86400`（24 時間）/ `604800`（7 日）/ `2592000`（30 日）のどれか。
+- 期限内のトークンは 20 件まで（超える発行は 400、`field` なし）。
+- `TTS_TOKEN` が無い構成（通常の API に認証が無い）では 409 `conflict`（本文の検査より先）。
+- 使えるのは通常の API（`GET /v1/engines`・`POST /v1/synthesize`・`POST /v1/normalize`・`GET /v1/dictionary`）だけ。`/v1/admin/*` は 401。
+
+| 状態 | 条件 |
+|---|---|
+| 201 | 発行した |
+| 400 `invalid_request` | 未知のフィールド・`label` / `expiresInSec` の欠落や不正（`field` 付き）、期限内が 20 件（`field` なし） |
+| 401 | 管理のトークンが無い・違う（発行したトークンでも 401） |
+| 409 `conflict` | `TTS_TOKEN` が無く発行できない |
+| 415 | 本文が JSON でない |
+
+### DELETE /v1/admin/tokens/{id}
+
+失効する（期限切れなら一覧から消す）。次の要求から 401 になる。`204`。無い id・形の違う id は 404（`token <id> not found`）。
+ファイルへの書き込みに失敗したら 500 を返すが、メモリでは消えたまま（60 秒ごとに書き直す）。書けないまま再起動するとそのトークンは戻る。
 
 ### DELETE /v1/admin/cache
 
