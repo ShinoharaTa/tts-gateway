@@ -433,7 +433,8 @@ const loadApiTokens = async () => {
 };
 
 const apiTokenItem = t => {
-  const left = Math.floor((Date.parse(t.expiresAt) - Date.now()) / 1000);
+  const left = t.expiresAt === null ? 0 : Math.floor((Date.parse(t.expiresAt) - Date.now()) / 1000);
+  const expiry = t.expiresAt === null ? '無期限' : t.expired ? `期限 ${fmtTime(t.expiresAt)}` : `期限 ${fmtTime(t.expiresAt)}（あと ${duration(Math.max(left, 0))}）`;
   return h(
     'li',
     {},
@@ -447,7 +448,7 @@ const apiTokenItem = t => {
     h(
       'div',
       { class: 'head' },
-      h('span', { class: 'muted small' }, t.expired ? `期限 ${fmtTime(t.expiresAt)}` : `期限 ${fmtTime(t.expiresAt)}（あと ${duration(Math.max(left, 0))}）`),
+      h('span', { class: 'muted small' }, expiry),
       h('span', { class: 'muted small' }, t.lastUsedAt ? `最終使用 ${fmtTime(t.lastUsedAt)}` : '未使用'),
     ),
     h(
@@ -474,7 +475,7 @@ const removeApiToken = async t => {
 
 const issueApiToken = async ev => {
   ev.preventDefault();
-  const body = { label: $('apitokens-label').value.trim(), expiresInSec: Number($('apitokens-expires').value) };
+  const body = { label: $('apitokens-label').value.trim(), expiresInSec: $('apitokens-expires').value === '' ? null : Number($('apitokens-expires').value) };
   $('apitokens-submit').disabled = true;
   try {
     const t = await api('/v1/admin/tokens', { method: 'POST', body });

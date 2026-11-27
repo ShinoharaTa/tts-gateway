@@ -29,7 +29,7 @@ import { SettingsStore, validateSettingsPatch } from './settings.ts';
 import { Synthesizer } from './synthesize.ts';
 import { Dictionary } from './text/readings.ts';
 import { EXPIRES_IN_SEC, FLUSH_INTERVAL_MS, MAX_LABEL_CHARS, TokenStore, type TokenView } from './tokens.ts';
-import { charCount, checkEnum, checkKeys, checkObject, checkReading, checkString, checkSurface } from './validate.ts';
+import { charCount, checkKeys, checkObject, checkReading, checkString, checkSurface } from './validate.ts';
 
 export type App = {
   config: Config;
@@ -414,7 +414,10 @@ const issueToken = async (app: App, raw: unknown, f: ReqFields): Promise<{ view:
   if (!label || charCount(label) > MAX_LABEL_CHARS) throw invalid(`label must be 1 to ${MAX_LABEL_CHARS} characters`, 'label');
   if (/\p{Cc}/u.test(label)) throw invalid('label must not contain control characters', 'label');
   if (body.expiresInSec === undefined) throw invalid('expiresInSec is required', 'expiresInSec');
-  const expiresInSec = checkEnum(body.expiresInSec, 'expiresInSec', EXPIRES_IN_SEC);
+  // null は無期限
+  const expiresInSec = body.expiresInSec as number | null;
+  if (expiresInSec !== null && !(EXPIRES_IN_SEC as readonly unknown[]).includes(expiresInSec))
+    throw invalid(`expiresInSec must be one of ${EXPIRES_IN_SEC.join(', ')} or null`, 'expiresInSec');
   const r = await app.tokens.issue(label, expiresInSec);
   log.info('api token issued', { ...f, tokenId: r.view.id, label, expiresAt: r.view.expiresAt });
   return r;

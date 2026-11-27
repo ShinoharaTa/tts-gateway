@@ -14,8 +14,8 @@ import { writeAtomic } from './settings.ts';
 
 export const TOKEN_RE = /^ttsg_([0-9a-f]{8})_[0-9a-f]{48}$/;
 export const TOKEN_ID_RE = /^[0-9a-f]{8}$/;
-/** 期限の選択肢（秒）: 1 時間・24 時間・7 日・30 日 */
-export const EXPIRES_IN_SEC = [3600, 86400, 604800, 2592000] as const;
+/** 期限の選択肢（秒）: 1 時間・24 時間・7 日・30 日・90 日・1 年。無期限は null で指定する */
+export const EXPIRES_IN_SEC = [3600, 86400, 604800, 2592000, 7776000, 31536000] as const;
 /** 期限内のトークンの数の上限 */
 export const MAX_ACTIVE_TOKENS = 20;
 /** 期限切れを含めたレコードの数の上限（超えたら期限切れの古いものから消す） */
@@ -26,8 +26,8 @@ export const EXPIRED_KEEP_MS = 7 * 86_400_000;
 /** 掃除と最終使用時刻の書き込みの間隔 */
 export const FLUSH_INTERVAL_MS = 60_000;
 
-export type TokenRecord = { id: string; label: string; hash: string; createdAt: string; expiresAt: string; lastUsedAt: string | null };
-export type TokenView = { id: string; label: string; createdAt: string; expiresAt: string; lastUsedAt: string | null; expired: boolean };
+export type TokenRecord = { id: string; label: string; hash: string; createdAt: string; expiresAt: string | null; lastUsedAt: string | null };
+export type TokenView = { id: string; label: string; createdAt: string; expiresAt: string | null; lastUsedAt: string | null; expired: boolean };
 
 const HASH_RE = /^[0-9a-f]{64}$/;
 
@@ -51,13 +51,13 @@ const parseFile = (text: string): TokenRecord[] => {
       typeof r.id === 'string' && TOKEN_ID_RE.test(r.id) && !ids.has(r.id) &&
       typeof r.label === 'string' &&
       typeof r.hash === 'string' && HASH_RE.test(r.hash) &&
-      isDate(r.createdAt) && isDate(r.expiresAt) &&
+      isDate(r.createdAt) && (r.expiresAt === null || isDate(r.expiresAt)) &&
       (r.lastUsedAt === null || isDate(r.lastUsedAt));
     if (!ok) throw new Error(`tokens[${i}] is malformed`);
     ids.add(r.id as string);
     return {
       id: r.id as string, label: r.label as string, hash: r.hash as string,
-      createdAt: r.createdAt as string, expiresAt: r.expiresAt as string, lastUsedAt: r.lastUsedAt as string | null,
+      createdAt: r.createdAt as string, expiresAt: r.expiresAt as string | null, lastUsedAt: r.lastUsedAt as string | null,
     };
   });
 };
@@ -103,7 +103,7 @@ export class TokenStore {
   }
 
   private isExpired(t: TokenRecord): boolean {
-    return this.now() >= Date.parse(t.expiresAt);
+    return t.expiresAt !== null && this.now() >= Date.parse(t.expiresAt);
   }
 
   private view(t: TokenRecord): TokenView {
@@ -114,7 +114,7 @@ export class TokenStore {
   private purge(): number {
     const now = this.now();
     const before = this.tokens.length;
-    this.tokens = this.tokens.filter(t => Date.parse(t.expiresAt) + EXPIRED_KEEP_MS > now);
+    this.tokens = this.tokens.filter(t => t.expiresAt === null || Date.parse(t.expiresAt) + EXPIRED_KEEP_MS > now);
     const count = before - this.tokens.length;
     if (count > 0) log.info('api tokens purged', { count });
     return count;
@@ -129,13 +129,13 @@ export class TokenStore {
   }
 
   /** 発行する。値（token）を返すのはここだけ。保存に失敗したら登録せずに reject */
-  async issue(label: string, expiresInSec: number): Promise<{ view: TokenView; token: string }> {
+  async issue(label: string, expiresInSec: number | null): Promise<{ view: TokenView; token: string }> {
     this.purge();
     if (this.tokens.filter(t => !this.isExpired(t)).length >= MAX_ACTIVE_TOKENS)
       throw invalid(`too many active tokens (up to ${MAX_ACTIVE_TOKENS})`);
     if (this.tokens.length >= MAX_TOKEN_RECORDS) {
       // 期限切れを expiresAt の古い順に消す
-      const expired = this.tokens.filter(t => this.isExpired(t)).sort((a, b) => Date.parse(a.expiresAt) - Date.parse(b.expiresAt));
+      const expired = this.tokens.filter(t => this.isExpired(t)).sort((a, b) => Date.parse(a.expiresAt!) - Date.parse(b.expiresAt!));
       const drop = new Set(expired.slice(0, this.tokens.length - MAX_TOKEN_RECORDS + 1));
       this.tokens = this.tokens.filter(t => !drop.has(t));
     }
@@ -146,7 +146,7 @@ export class TokenStore {
     const created = Math.floor(this.now() / 1000) * 1000;
     const rec: TokenRecord = {
       id, label, hash: sha256(token).toString('hex'),
-      createdAt: iso(created), expiresAt: iso(created + expiresInSec * 1000), lastUsedAt: null,
+      createdAt: iso(created), expiresAt: expiresInSec === null ? null : iso(created + expiresInSec * 1000), lastUsedAt: null,
     };
     this.tokens.push(rec);
     try {
