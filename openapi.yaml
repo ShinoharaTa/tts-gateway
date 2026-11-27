@@ -604,7 +604,7 @@ paths:
         値（token）を返すのはこの応答の 1 回だけ（サーバーはハッシュだけを保存する）。形式は `ttsg_` + id（hex 8 桁）+ `_` + hex 48 桁（全 62 字）。
         使えるのは通常の API（GET /v1/engines・POST /v1/synthesize・POST /v1/normalize・GET /v1/dictionary）だけで、/v1/admin/* は 401。
         label は必須で前後の空白を落として 1〜40 字（コードポイント数）、制御文字は不可、同じラベルも可。
-        expiresInSec は 3600（1 時間）/ 86400（24 時間）/ 604800（7 日）/ 2592000（30 日）のどれか。
+        expiresInSec は 3600（1 時間）/ 86400（24 時間）/ 604800（7 日）/ 2592000（30 日）/ 7776000（90 日）/ 31536000（1 年）のどれか、または null（無期限）。無期限のトークンの expiresAt は null で、失効するまで使える。
         期限内のトークンは 20 件まで（超える発行は 400、field なし）。
         TTS_TOKEN が無い構成（通常の API に認証が無い）では 409 conflict（本文の検査より先）。
       requestBody:
@@ -1584,8 +1584,9 @@ components:
           type: string
           format: date-time
         expiresAt:
-          type: string
+          type: [string, 'null']
           format: date-time
+          description: 無期限なら null
         lastUsedAt:
           type: [string, 'null']
           format: date-time
@@ -1616,8 +1617,9 @@ components:
           maxLength: 40
           description: 用途のメモ。前後の空白を落として 1〜40 字（コードポイント数）、制御文字は不可
         expiresInSec:
-          type: integer
-          enum: [3600, 86400, 604800, 2592000]
+          type: [integer, 'null']
+          enum: [3600, 86400, 604800, 2592000, 7776000, 31536000, null]
+          description: 期限までの秒数。null は無期限
     ApiTokenIssued:
       type: object
       additionalProperties: false
@@ -1634,8 +1636,9 @@ components:
           type: string
           format: date-time
         expiresAt:
-          type: string
+          type: [string, 'null']
           format: date-time
+          description: 無期限なら null
         lastUsedAt:
           type: [string, 'null']
           format: date-time

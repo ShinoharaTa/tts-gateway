@@ -963,7 +963,7 @@ const USER = 'user-token-for-tests';
 
 const bearer = (token?: string): Record<string, string> => (token ? { Authorization: `Bearer ${token}` } : {});
 
-type Issued = { id: string; label: string; createdAt: string; expiresAt: string; lastUsedAt: string | null; expired: boolean; token: string };
+type Issued = { id: string; label: string; createdAt: string; expiresAt: string | null; lastUsedAt: string | null; expired: boolean; token: string };
 
 const issue = async (c: Ctx, by: string | undefined, body: unknown = { label: 'pixel', expiresInSec: 3600 }): Promise<Response> =>
   fetch(`${c.base}/v1/admin/tokens`, json(body, bearer(by)));
@@ -1115,8 +1115,8 @@ test('API トークン: 本文の検査（400 と field）・415・ラベルの 
       [{ label: 'a\u0007b', expiresInSec: 3600 }, 'label', 'label must not contain control characters'],
       [{ label: 1, expiresInSec: 3600 }, 'label', 'label must be a string'],
       [{ label: 'a' }, 'expiresInSec', 'expiresInSec is required'],
-      [{ label: 'a', expiresInSec: 60 }, 'expiresInSec', 'expiresInSec must be one of 3600, 86400, 604800, 2592000'],
-      [{ label: 'a', expiresInSec: '3600' }, 'expiresInSec', 'expiresInSec must be one of 3600, 86400, 604800, 2592000'],
+      [{ label: 'a', expiresInSec: 60 }, 'expiresInSec', 'expiresInSec must be one of 3600, 86400, 604800, 2592000, 7776000, 31536000 or null'],
+      [{ label: 'a', expiresInSec: '3600' }, 'expiresInSec', 'expiresInSec must be one of 3600, 86400, 604800, 2592000, 7776000, 31536000 or null'],
     ];
     for (const [body, field, message] of cases) {
       const r = await issue(c, ADMIN, body);
@@ -1242,6 +1242,22 @@ test('API トークン: 設定画面に API トークンのカードがある', 
   try {
     const html = await (await fetch(`${c.base}/admin/`)).text();
     assert.match(html, /id="apitokens-card"/);
+  } finally {
+    await c.stop();
+  }
+});
+
+test('API トークン: expiresInSec に 90 日・1 年・null（無期限）を指定できる', async () => {
+  const c = await start({ TTS_TOKEN: USER, TTS_ADMIN_TOKEN: ADMIN }, { now: () => T0 });
+  try {
+    assert.equal((await issued(c, ADMIN, { label: 'q', expiresInSec: 7776000 })).expiresAt, '2026-04-01T00:00:00Z');
+    assert.equal((await issued(c, ADMIN, { label: 'y', expiresInSec: 31536000 })).expiresAt, '2027-01-01T00:00:00Z');
+    const t = await issued(c, ADMIN, { label: 'forever', expiresInSec: null });
+    assert.equal(t.expiresAt, null);
+    assert.equal(t.expired, false);
+    assert.equal((await fetch(`${c.base}/v1/engines`, { headers: bearer(t.token) })).status, 200);
+    const list = (await (await fetch(`${c.base}/v1/admin/tokens`, { headers: bearer(ADMIN) })).json()) as { tokens: { label: string; expiresAt: string | null }[] };
+    assert.equal(list.tokens.find(x => x.label === 'forever')!.expiresAt, null);
   } finally {
     await c.stop();
   }

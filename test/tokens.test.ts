@@ -266,3 +266,23 @@ test('書き込み失敗: issue は reject して残らない、revoke は rejec
     await s.cleanup();
   }
 });
+
+test('無期限（null）: expiresAt は null で、何年たっても通り、掃除されず、読み直しても残る。失効はできる', async () => {
+  const s = await setup();
+  try {
+    const { view, token } = await s.store.issue('forever', null);
+    assert.equal(view.expiresAt, null);
+    assert.equal(view.expired, false);
+    await s.store.issue('year', 31536000);
+    s.clock.t = T0 + 10 * 365 * 24 * HOUR;
+    assert.equal(s.store.verify(token), view.id);
+    await s.store.tick();
+    assert.deepEqual(s.store.list().map(t => [t.label, t.expiresAt, t.expired]), [['forever', null, false]]);
+    const again = await TokenStore.load(s.dir, s.now);
+    assert.equal(again.verify(token), view.id);
+    assert.ok(await s.store.revoke(view.id));
+    assert.equal(s.store.verify(token), null);
+  } finally {
+    await s.cleanup();
+  }
+});
